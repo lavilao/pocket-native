@@ -1,4 +1,4 @@
-# the 32-bit build of the Android app's library, a workflow of its own so
+# the 32-bit build of the Android app, a workflow of its own so
 # it finishes and its artifact is ready without waiting for CI's tests or
 # the 64-bit build; run it alone from the Actions tab when only it matters
 name: CI 32-bit
@@ -22,6 +22,28 @@ jobs:
           export CC_armv7_linux_androideabi="$bin/armv7a-linux-androideabi29-clang"
           export AR_armv7_linux_androideabi="$bin/llvm-ar"
           cargo build --release --locked --target armv7-linux-androideabi -p pocket-native-android
+      - name: make the APK
+        run: |
+          tools="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          jar="$(ls "$ANDROID_HOME"/platforms/android-*/android.jar | sort -V | tail -1)"
+          # JDK 17, whose javac output d8 in the build tools takes
+          [ -d "${JAVA_HOME_17_X64:-}" ] && export JAVA_HOME="$JAVA_HOME_17_X64"
+          export PATH="$JAVA_HOME/bin:$PATH" BUILD_TOOLS_BIN="$tools" ANDROID_JAR="$jar"
+          "$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+              -o libpocketnative.so target/armv7-linux-androideabi/release/libpocketnative.so
+          rm -rf assets-out && mkdir -p assets-out/titles
+          for profile in titles/*/profile.toml; do
+              mkdir -p "assets-out/$(dirname "$profile")"
+              cp "$profile" "assets-out/$profile"
+          done
+          python3 tools/third_party.py assets-out/THIRD_PARTY_LICENSES.txt pocket-native-android armv7-linux-androideabi >/dev/null
+          cp LICENSE CREDITS.md assets/fonts/OFL.txt assets-out/
+          bash scripts/android/make_apk.sh io.github.pocketnative.test "Pocket Native (test)" \
+              libpocketnative.so assets-out pocket-native-32bit.apk test.keystore armeabi-v7a
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pocket-native-32bit-apk
+          path: pocket-native-32bit.apk
       - uses: actions/upload-artifact@v4
         with:
           name: pocket-native-android-armv7

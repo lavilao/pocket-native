@@ -1,16 +1,17 @@
 #!/bin/bash
-# make_apk.sh <package> <label> <libpocketnative.so> <assets dir> <out.apk> <keystore>
+# make_apk.sh <package> <label> <libpocketnative.so> <assets dir> <out.apk> <keystore> [abi]
 #
 # Packages Pocket Native's app with the SDK's build tools, no Gradle: the
 # manifest linked against the platform with the profiles as assets, the
 # launcher's and the game's Java classes as classes.dex, the engine in
-# lib/arm64-v8a, aligned and signed with the keystore, which is made the
-# first time. Keep the keystore: an update signed with another one will not
-# install over the app, which would have to be uninstalled first, saves and
-# all. KEYSTORE_PASS is its password, "android" for a test key.
+# lib/<abi>, arm64-v8a or armeabi-v7a, aligned and signed with the keystore,
+# which is made the first time. Keep the keystore: an update signed with
+# another one will not install over the app, which would have to be
+# uninstalled first, saves and all. KEYSTORE_PASS is its password, "android"
+# for a test key.
 set -euo pipefail
 
-package="$1" label="$2" engine="$3" assets="$4" out="$5" keystore="$6"
+package="$1" label="$2" engine="$3" assets="$4" out="$5" keystore="$6" abi="${7:-arm64-v8a}"
 pass="${KEYSTORE_PASS:-android}"
 here="$(cd "$(dirname "$0")" && pwd)"
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$here/../../Cargo.toml" | head -1)
@@ -32,8 +33,8 @@ javac -nowarn --release 11 -classpath "$ANDROID_JAR" -d "$work/classes" "${sourc
 mapfile -t classes < <(find "$work/classes" -name '*.class')
 "$BUILD_TOOLS_BIN/d8" --min-api 30 --lib "$ANDROID_JAR" --output "$work/dex" "${classes[@]}"
 (cd "$work/dex" && zip -q "$work/unaligned.apk" classes.dex)
-mkdir -p "$work/lib/arm64-v8a"
-cp "$engine" "$work/lib/arm64-v8a/libpocketnative.so"
+mkdir -p "$work/lib/$abi"
+cp "$engine" "$work/lib/$abi/libpocketnative.so"
 # stored, not compressed, and page-aligned by zipalign -p, so that Android
 # loads it from the APK itself rather than unpacking a second copy
 (cd "$work" && zip -q -r -0 unaligned.apk lib)
