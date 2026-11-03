@@ -1,7 +1,10 @@
 //! virtual memory, the guest page table, and the [Bus] the CPU talks to.
 
 pub mod config;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// the view is the guest's whole 4 GiB address space at its own offsets in
+// the host's, which only a 64-bit host can hold; 32-bit hosts run the same
+// code through the page tables below
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_pointer_width = "64"))]
 pub mod fastmem;
 pub mod physical;
 
@@ -83,8 +86,8 @@ pub struct Memory {
     pub new_fault: Option<VAddr>,
 
     /// the whole address space at once, for recompiled code, when the host
-    /// can have it.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    /// can have it, which a 32-bit host cannot.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), target_pointer_width = "64"))]
     view: Option<fastmem::View>,
 
     /// where the linear heap starts, the addresses the GPU's journal keeps
@@ -106,7 +109,7 @@ impl Memory {
             mappings: BTreeMap::new(),
             faults: BTreeMap::new(),
             new_fault: None,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(all(any(target_os = "linux", target_os = "android"), target_pointer_width = "64"))]
             view: fastmem::View::new(),
             linear_base: 0,
         }
@@ -134,9 +137,9 @@ impl Memory {
     }
 
     /// where the guest's address 0 is in the host's view of all of it, null
-    /// without one.
+    /// without one, which is always so on a 32-bit host.
     pub fn fastmem(&self) -> *mut u8 {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(any(target_os = "linux", target_os = "android"), target_pointer_width = "64"))]
         if let (Some(view), true) = (&self.view, self.phys.backing(FCRAM_PADDR, PAGE_SIZE).is_some()) {
             return view.base();
         }
@@ -174,7 +177,7 @@ impl Memory {
             }
         }
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(any(target_os = "linux", target_os = "android"), target_pointer_width = "64"))]
         if let Some(view) = &self.view {
             match self.phys.backing(paddr, size) {
                 Some((fd, offset)) => {
@@ -224,7 +227,7 @@ impl Memory {
     }
 
     pub fn unmap(&mut self, vaddr: VAddr, size: u32) {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(any(target_os = "linux", target_os = "android"), target_pointer_width = "64"))]
         if let Some(view) = &self.view {
             view.unmap(vaddr, size);
         }

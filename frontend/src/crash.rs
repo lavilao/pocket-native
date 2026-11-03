@@ -110,6 +110,9 @@ extern "C" fn on_signal(signal: libc::c_int, info: *mut libc::siginfo_t, context
         let (pc, caller) = (context.uc_mcontext.pc, Some(context.uc_mcontext.regs[30]));
         #[cfg(target_arch = "x86_64")]
         let (pc, caller) = (context.uc_mcontext.gregs[libc::REG_RIP as usize] as u64, None::<u64>);
+        // 32-bit ARM, whose registers are arm_ prefixed
+        #[cfg(target_arch = "arm")]
+        let (pc, caller) = (context.uc_mcontext.arm_pc as u64, Some(context.uc_mcontext.arm_lr as u64));
         line.text(b", at ");
         line.place(pc);
         if let Some(caller) = caller {
