@@ -2,7 +2,9 @@
 //! guest address at its own offset from the start, so recompiled code reaches
 //! memory with one load or store instead of a page table walk. pages the
 //! guest has not mapped fault, and the handler puts a page of zeros there,
-//! which is what reading unmapped memory gives anyway.
+//! which is what reading unmapped memory gives anyway. only for 64-bit
+//! hosts: the view is 4 GiB and a page, more than a 32-bit host has, whose
+//! recompiled code goes through the page tables instead.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

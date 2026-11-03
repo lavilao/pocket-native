@@ -31,6 +31,13 @@ extern "C" fn sampled(_: i32, _: *mut libc::siginfo_t, context: *mut libc::c_voi
         };
         #[cfg(target_arch = "x86_64")]
         let pair = ((*(context as *const libc::ucontext_t)).uc_mcontext.gregs[libc::REG_RIP as usize] as u64, 0);
+        // 32-bit ARM, where the libc crate's ucontext is the kernel's: the
+        // padding quirks of the other Android targets are after uc_mcontext
+        #[cfg(target_arch = "arm")]
+        let pair = {
+            let mcontext = (*(context as *const libc::ucontext_t)).uc_mcontext;
+            (mcontext.arm_pc as u64, mcontext.arm_lr as u64)
+        };
         pair
     };
     // SAFETY: gettid is async-signal-safe
