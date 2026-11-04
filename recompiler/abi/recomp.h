@@ -201,7 +201,10 @@ static inline void (mem_write32)(Context *ctx, uint32_t address, uint32_t value)
 
 #ifdef RECOMP_FASTMEM
 /* one access at the address's own offset in the host's view of the guest's
-   memory, which has every page mapped */
+   memory, which has every page mapped. a 64-bit host holds the guest's whole
+   4 GiB, so the address goes in whole; a 32-bit host can only hold 1 GiB of
+   it, and the address is masked into that, which changes nothing the guest
+   can notice, everything it may touch being below 0x40000000. */
 #undef mem_read8
 #undef mem_read16
 #undef mem_read32
@@ -212,12 +215,17 @@ static inline void (mem_write32)(Context *ctx, uint32_t address, uint32_t value)
    could be to the context as far as the compiler knows, which would have it
    load ctx->fastmem again after every one */
 #define RECOMP_VIEW(ctx) ((ctx)->fastmem)
-#define mem_read8(ctx, address) (*(const uint8_t *)(RECOMP_VIEW(ctx) + (uint32_t)(address)))
-#define mem_read16(ctx, address) ({ uint16_t __v; __builtin_memcpy(&__v, RECOMP_VIEW(ctx) + (uint32_t)(address), 2); __v; })
-#define mem_read32(ctx, address) ({ uint32_t __v; __builtin_memcpy(&__v, RECOMP_VIEW(ctx) + (uint32_t)(address), 4); __v; })
-#define mem_write8(ctx, address, value) do { *(RECOMP_VIEW(ctx) + (uint32_t)(address)) = (uint8_t)(value); } while (0)
-#define mem_write16(ctx, address, value) do { uint16_t __v = (value); __builtin_memcpy(RECOMP_VIEW(ctx) + (uint32_t)(address), &__v, 2); } while (0)
-#define mem_write32(ctx, address, value) do { uint32_t __v = (value); __builtin_memcpy(RECOMP_VIEW(ctx) + (uint32_t)(address), &__v, 4); } while (0)
+#if UINTPTR_MAX == 0xFFFFFFFFu
+#define RECOMP_VIEW_OFFSET(address) ((uint32_t)(address) & 0x3FFFFFFFu)
+#else
+#define RECOMP_VIEW_OFFSET(address) ((uint32_t)(address))
+#endif
+#define mem_read8(ctx, address) (*(const uint8_t *)(RECOMP_VIEW(ctx) + RECOMP_VIEW_OFFSET(address)))
+#define mem_read16(ctx, address) ({ uint16_t __v; __builtin_memcpy(&__v, RECOMP_VIEW(ctx) + RECOMP_VIEW_OFFSET(address), 2); __v; })
+#define mem_read32(ctx, address) ({ uint32_t __v; __builtin_memcpy(&__v, RECOMP_VIEW(ctx) + RECOMP_VIEW_OFFSET(address), 4); __v; })
+#define mem_write8(ctx, address, value) do { *(RECOMP_VIEW(ctx) + RECOMP_VIEW_OFFSET(address)) = (uint8_t)(value); } while (0)
+#define mem_write16(ctx, address, value) do { uint16_t __v = (value); __builtin_memcpy(RECOMP_VIEW(ctx) + RECOMP_VIEW_OFFSET(address), &__v, 2); } while (0)
+#define mem_write32(ctx, address, value) do { uint32_t __v = (value); __builtin_memcpy(RECOMP_VIEW(ctx) + RECOMP_VIEW_OFFSET(address), &__v, 4); } while (0)
 #endif
 
 #define C_EQ (F_Z)

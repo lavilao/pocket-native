@@ -3,8 +3,9 @@
 # app, pocket-native.apk in the output directory (build/ by default), inside
 # a container (podman or docker). --test makes io.github.pocketnative.test,
 # signed with a test key, which installs beside the real app. --32bit builds
-# armeabi-v7a, for a 32-bit device, which games have to be built for too,
-# without RECOMP_FASTMEM. The real app is signed with the keystore in
+# armeabi-v7a, for a 32-bit device, whose games have to be built for too,
+# with RECOMP_FASTMEM as on any other host, the view on a 32-bit one being
+# the guest's low 1 GiB. The real app is signed with the keystore in
 # KEYSTORE (its password in KEYSTORE_PASS), kept by whoever releases it.
 set -euo pipefail
 
