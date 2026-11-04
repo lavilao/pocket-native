@@ -2,8 +2,8 @@
 # inside.sh <out.apk> <keystore> [package] [abi]: the Android app, built in
 # the container: /src the repository, read only, /work the scratch space kept
 # between builds. abi is arm64-v8a, the default, or armeabi-v7a for a 32-bit
-# device, whose games have to be built without RECOMP_FASTMEM, which
-# 3dsrecomp does unless RECOMP_CFLAGS says otherwise.
+# device, whose games can be built with RECOMP_FASTMEM too, the view on a
+# 32-bit host being the guest's low 1 GiB, every address masked into it.
 set -euo pipefail
 out="$1" keystore="$2" package="${3:-io.github.pocketnative}" abi="${4:-arm64-v8a}"
 case "$abi" in

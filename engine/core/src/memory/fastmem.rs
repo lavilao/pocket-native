@@ -2,14 +2,22 @@
 //! guest address at its own offset from the start, so recompiled code reaches
 //! memory with one load or store instead of a page table walk. pages the
 //! guest has not mapped fault, and the handler puts a page of zeros there,
-//! which is what reading unmapped memory gives anyway. only for 64-bit
-//! hosts: the view is 4 GiB and a page, more than a 32-bit host has, whose
-//! recompiled code goes through the page tables instead.
+//! which is what reading unmapped memory gives anyway. a 64-bit host holds
+//! the guest's whole 4 GiB, every address going in plain; a 32-bit host has
+//! no room for that, so its view is 1 GiB and the code masks every address
+//! into it, which the guest never notices, everything it may touch lying
+//! below 0x40000000.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// 4 GiB and a page, an access at the very top may run past the end.
+/// the view's span, and a page over it, since an access at the very top may
+/// run past the end: the guest's 4 GiB on a 64-bit host, and on a 32-bit one
+/// 1 GiB, about all its 3 GiB of user space that can be spared, the code
+/// masking addresses into the low GiB, where the whole guest lives anyway.
+#[cfg(target_pointer_width = "64")]
 const SPAN: usize = (1 << 32) + 0x1000;
+#[cfg(target_pointer_width = "32")]
+const SPAN: usize = (1 << 30) + 0x1000;
 /// views at once, tests make many.
 const SLOTS: usize = 64;
 
@@ -58,6 +66,11 @@ impl View {
 
     /// size bytes of the shared file from offset at vaddr.
     pub fn map(&self, vaddr: u32, size: u32, fd: i32, offset: u64) -> bool {
+        // only what the view holds, whatever its width: the kernel hands the
+        // guest nothing above the low GiB that a 32-bit host's view covers.
+        if (vaddr as u64) + (size as u64) > SPAN as u64 {
+            return false;
+        }
         // SAFETY: inside the reservation, which only this view uses
         let mapped = unsafe {
             libc::mmap(
@@ -74,6 +87,9 @@ impl View {
 
     /// leaves size bytes at vaddr unmapped again.
     pub fn unmap(&self, vaddr: u32, size: u32) {
+        if (vaddr as u64) + (size as u64) > SPAN as u64 {
+            return;
+        }
         // SAFETY: as in map
         unsafe {
             libc::mmap(
@@ -120,7 +136,9 @@ extern "C" fn on_fault(signal: libc::c_int, info: *mut libc::siginfo_t, context:
         let address = (*info).si_addr() as usize;
         for view in &VIEWS {
             let base = view.load(Ordering::Acquire);
-            if base != 0 && (base..base + SPAN).contains(&address) {
+            // subtracting, rather than adding to base, which on a 32-bit host
+            // would wrap the view's end around the address space
+            if base != 0 && address >= base && address - base < SPAN {
                 let page = address & !0xFFF;
                 libc::mmap(
                     page as *mut libc::c_void,
