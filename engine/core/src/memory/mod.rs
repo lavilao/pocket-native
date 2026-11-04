@@ -6,6 +6,7 @@ pub mod config;
 // into it, on a 32-bit one, which holds that much and no more
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod fastmem;
+pub use fastmem::reserve_early;
 pub mod physical;
 
 use std::collections::BTreeMap;

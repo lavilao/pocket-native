@@ -451,6 +451,7 @@ fn store_rows<const BPP: usize>(data: &[u8], out: &mut [u8], width: u32, height:
 const LIGHTING_BASE: usize = 68;
 
 
+
 #[derive(Default)]
 struct Cached {
     framebuffer: Option<glow::Framebuffer>,

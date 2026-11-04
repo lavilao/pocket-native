@@ -28,14 +28,61 @@ pub static FAULTS: AtomicUsize = AtomicUsize::new(0);
 /// the fault handler there was before ours, for faults that are not ours.
 static mut PREVIOUS: Option<libc::sigaction> = None;
 
+/// a view reserved early, in android_main before EGL/ART fragment the
+/// 32-bit address space, that View::new adopts instead of reserving.
+/// (base, slot) once set; 0 means no early reservation.
+static EARLY_BASE: AtomicUsize = AtomicUsize::new(0);
+static EARLY_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
 pub struct View {
     base: *mut u8,
     slot: usize,
 }
 
+/// reserve the view's address space now, before the process fragments
+/// its 32-bit address space. View::new adopts it instead of reserving
+/// again; if no early reservation was made this does nothing.
+pub fn reserve_early() {
+    if EARLY_BASE.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    install();
+    // SAFETY: a reservation of address space only, checked
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            SPAN,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        log::warn!("fastmem: early reservation of {} MiB failed: {}", SPAN >> 20, std::io::Error::last_os_error());
+        return;
+    }
+    let base = base as usize;
+    let Some(slot) = VIEWS.iter().position(|view| view.compare_exchange(0, base, Ordering::AcqRel, Ordering::Acquire).is_ok()) else {
+        // SAFETY: the reservation just made
+        unsafe { libc::munmap(base as *mut libc::c_void, SPAN) };
+        return;
+    };
+    EARLY_SLOT.store(slot, Ordering::SeqCst);
+    EARLY_BASE.store(base, Ordering::SeqCst);
+    log::info!("fastmem: early 1 GiB view reserved at 0x{base:08X}");
+}
+
 impl View {
     /// a view with nothing mapped, none when the host cannot have one.
     pub fn new() -> Option<View> {
+        // adopt the early reservation from android_main, if there is one:
+        // it got the biggest hole before ART/EGL fragmented the space
+        let early = EARLY_BASE.swap(0, Ordering::SeqCst);
+        if early != 0 {
+            let slot = EARLY_SLOT.load(Ordering::SeqCst);
+            return Some(View { base: early as *mut u8, slot });
+        }
         install();
         // SAFETY: a reservation of address space only, checked
         let base = unsafe {

@@ -658,6 +658,24 @@ pub(super) fn combiner_source(constants: &[u32; FRAGMENT_CONSTANTS]) -> String {
 }
 
 pub(super) fn fragment_source(constants: &[u32; FRAGMENT_CONSTANTS], writes_depth: bool, lighting: &[u32]) -> String {
+    // the generic program stands in while a draw's own compiles, and with
+    // every switch live it is the worst case a driver is asked for:
+    // PowerVR's UniFlex kept the Redmi 9's 3D black rather than compile it.
+    // Its stand-in is then just the vertex color, nothing of the stages, so
+    // the long program is never the one handed to the compiler. Specialized
+    // programs, which are what draws use once built, still take the full
+    // source below.
+    if constants[29] != 0 {
+        let mut stand_in = String::from(
+            "#version 310 es\nprecision highp float;\nlayout(location = 0) in vec4 in_color;\nlayout(location = 0) out vec4 out_color;\nvoid main() { out_color = clamp(in_color, 0.0, 1.0); }\n",
+        );
+        if writes_depth {
+            // the depth the draw writes still has to come from somewhere:
+            // the vertex stage's two varyings give it back as it had it
+            stand_in = "#version 310 es\nprecision highp float;\nlayout(location = 0) in vec4 in_color;\nlayout(location = 0) out vec4 out_color;\nlayout(location = 3) in float in_depth_w;\nlayout(location = 6) in float in_w;\nvoid main() { out_color = clamp(in_color, 0.0, 1.0); gl_FragDepth = in_depth_w / in_w; }\n".to_owned();
+        }
+        return stand_in;
+    }
     let mut out = String::from("#version 310 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n");
     if writes_depth {
         out.push_str("#define WRITES_DEPTH\n");

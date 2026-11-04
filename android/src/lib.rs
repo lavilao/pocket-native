@@ -38,6 +38,12 @@ const TOUCHSCREEN: u32 = 0x0000_1002;
 
 #[no_mangle]
 fn android_main(app: AndroidApp) {
+    // the 1 GiB fastmem reservation first, before the window, EGL and the
+    // game thread fragment the 32-bit address space: on a 32-bit host this
+    // is the hardest mapping to place and the difference between fastmem
+    // working and the game running interpreted
+    #[cfg(target_os = "android")]
+    zakuro_core::reserve_early();
     let own = app.internal_data_path().unwrap_or_else(|| PathBuf::from("/data/local/tmp/pocket-native"));
     let folder = match game_extra(&app) {
         Ok(Some(folder)) => PathBuf::from(folder),
