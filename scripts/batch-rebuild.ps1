@@ -1,10 +1,12 @@
-# batch-rebuild.ps1 [-Out folder]
+# batch-rebuild.ps1 [-Out folder] [-Bit32]
 #
 # batch-rebuild.sh for Windows: builds every game already in the output
 # folder, build\ by default, again with this kit, as after an update or with
-# the title.hints a handheld wrote.
+# the title.hints a handheld wrote, for the handheld or, with -Bit32, for a
+# 32-bit Android device.
 param(
-    [string]$Out = ""
+    [string]$Out = "",
+    [switch]$Bit32
 )
 
 $repo = Split-Path -Parent $PSScriptRoot
@@ -41,11 +43,16 @@ Write-Host "== building $($built.Count) game$(if ($built.Count -ne 1) { "s" }) a
 $status = 1
 try {
     $roms = @(Get-ChildItem -LiteralPath $staging -Filter *.3ds | ForEach-Object { $_.FullName })
-    & (Join-Path $repo "scripts\build.ps1") @roms -Out $Out
+    $build = @("-Out", $Out)
+    if ($Bit32) { $build += "-Bit32" }
+    & (Join-Path $repo "scripts\build.ps1") @roms @build
     $status = $LASTEXITCODE
 } finally {
     Restore
     if (-not (Get-ChildItem -LiteralPath $staging)) { Remove-Item -Recurse -Force -LiteralPath (Join-Path $repo ".update") }
 }
-if ($status -eq 0) { Write-Host "== done: copy `"Pocket Native`" onto the card again, over the old one" }
+if ($status -eq 0) {
+    if ($Bit32) { Write-Host "== done: copy `"Pocket Native`" onto the device again, over the old one" }
+    else { Write-Host "== done: copy `"Pocket Native`" onto the card again, over the old one" }
+}
 exit $status

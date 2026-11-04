@@ -1,18 +1,20 @@
 #!/bin/bash
-# batch-rebuild.sh [--out dir] [--wait]: builds every game already in the
-# output directory, build/ by default, again with this kit, as after an
-# update or with the title.hints a handheld wrote. --wait waits for Enter at
-# the end.
+# batch-rebuild.sh [--out dir] [--wait] [--32bit]: builds every game already
+# in the output directory, build/ by default, again with this kit, as after
+# an update or with the title.hints a handheld wrote, for the handheld or,
+# with --32bit, for a 32-bit Android device. --wait waits for Enter at the
+# end.
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-out="$repo/build" wait=""
+out="$repo/build" wait="" bits=64
 while [ $# -gt 0 ]; do
     case "$1" in
         --out) out="$(realpath -m "$2")"; shift 2 ;;
         --wait) wait=1; shift ;;
-        -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
-        *) echo "usage: scripts/batch-rebuild.sh [--out dir] [--wait]"; exit 2 ;;
+        --32bit) bits=32; shift ;;
+        -h|--help) sed -n '2,6p' "$0"; exit 0 ;;
+        *) echo "usage: scripts/batch-rebuild.sh [--out dir] [--wait] [--32bit]"; exit 2 ;;
     esac
 done
 
@@ -54,8 +56,14 @@ for game in "${built[@]}"; do
 done
 echo "== building ${#built[@]} game$([ ${#built[@]} = 1 ] || echo s) again"
 status=0
-bash "$repo/scripts/build.sh" "$staging"/*.3ds --out "$out" || status=$?
+extra=()
+[ "$bits" = 32 ] && extra=(--32bit)
+bash "$repo/scripts/build.sh" "$staging"/*.3ds --out "$out" "${extra[@]}" || status=$?
 restore
 rmdir "$staging" "$repo/.update" 2>/dev/null || true
-[ $status -eq 0 ] && echo "== done: copy \"Pocket Native\" onto the card again, over the old one"
+if [ $status -eq 0 ]; then
+    [ "$bits" = 32 ] \
+        && echo "== done: copy \"Pocket Native\" onto the device again, over the old one" \
+        || echo "== done: copy \"Pocket Native\" onto the card again, over the old one"
+fi
 exit $status

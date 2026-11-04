@@ -1,7 +1,9 @@
 #!/bin/bash
 # inside.sh <rom> [aes_keys.txt]: the build, in the container. /src is the
 # repository, read only, /work the scratch space kept between builds, and
-# /out where "Pocket Native" is put together.
+# /out where "Pocket Native" is put together. BITS=32 builds the game's
+# code for a 32-bit Android device instead of the handheld, whose own
+# program is left out: the app on the device plays it.
 set -euo pipefail
 
 # the open-source system font from Azahar's archives, generated from them
@@ -48,11 +50,24 @@ id=$(python3 tools/title_id.py "$game")
 name=$(sed -n '/^name = "/{s/^name = "\(.*\)"$/\1/p;q}' "titles/$id/profile.toml" 2>/dev/null || true)
 echo "== $id ${name:-(no profile yet)}"
 
-echo "== building the recompiler and Pocket Native"
-cargo build --release --locked -p recomp3ds --bin 3dsrecomp
-cargo build --release --locked --target aarch64-unknown-linux-gnu -p pocket-native
+# the game's code goes to the handheld, or with BITS=32 to a 32-bit Android
+# device, whose fastmem view is the guest's low 1 GiB
+cc=aarch64-linux-gnu-gcc-8
+strip=aarch64-linux-gnu-strip
+handheld=1
+if [ "${BITS:-64}" = 32 ]; then
+    cc=arm-linux-gnueabihf-gcc
+    strip=arm-linux-gnueabihf-strip
+    handheld=
+fi
 
-echo "== recompiling the game for the handheld"
+echo "== building the recompiler"
+cargo build --release --locked -p recomp3ds --bin 3dsrecomp
+if [ -n "$handheld" ]; then
+    cargo build --release --locked --target aarch64-unknown-linux-gnu -p pocket-native
+fi
+
+echo "== recompiling the game for $([ -n "$handheld" ] && echo the handheld || echo a 32-bit Android device)"
 # where the handheld had to interpret, which it writes beside the game on
 # the card, comes back with the card's folder and is recompiled too
 hints="$HOME/.local/share/3dsrecomp/$id.hints"
@@ -64,7 +79,7 @@ if [ -s "/out/Pocket Native/pocket-native/games/$id/title.hints" ]; then
 fi
 overrides=()
 [ -d "titles/$id/overrides" ] && overrides=(--overrides "titles/$id/overrides")
-RECOMP_CFLAGS=-DRECOMP_FASTMEM CC=aarch64-linux-gnu-gcc-8 "$CARGO_TARGET_DIR/release/3dsrecomp" build "$game" "/work/recomp/$id" "${overrides[@]}"
+RECOMP_CFLAGS=-DRECOMP_FASTMEM CC="$cc" "$CARGO_TARGET_DIR/release/3dsrecomp" build "$game" "/work/recomp/$id" "${overrides[@]}"
 
 if [ ! -f /work/shared_font.bin ]; then
     echo "== making the system font"
@@ -76,17 +91,23 @@ echo "== putting Pocket Native together"
 top="/out/Pocket Native"
 pn="$top/pocket-native"
 mkdir -p "$pn/games/$id/sysdata"
-aarch64-linux-gnu-strip -o "$pn/pocket-native" "$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/pocket-native"
+if [ -n "$handheld" ]; then
+    aarch64-linux-gnu-strip -o "$pn/pocket-native" "$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/pocket-native"
+    cp scripts/device/run.sh scripts/device/power.sh scripts/device/3ds.sh "$pn/"
+fi
 rm -rf "$pn/titles" && cp -r titles "$pn/titles"
-cp scripts/device/run.sh scripts/device/power.sh scripts/device/3ds.sh "$pn/"
 cp LICENSE CREDITS.md assets/fonts/OFL.txt "$pn/"
 python3 tools/third_party.py "$pn/THIRD_PARTY_LICENSES.txt" >/dev/null
-aarch64-linux-gnu-strip -o "$pn/games/$id/title.so" "/work/recomp/$id/$id.so"
+"$strip" -o "$pn/games/$id/title.so" "/work/recomp/$id/$id.so"
 cp /work/shared_font.bin "$pn/games/$id/sysdata/shared_font.bin"
 cp "$game" "$pn/games/$id/game.3ds"
 rm -f /work/game.*
-# FAT cards and Windows take no colons and a few other characters in a name
-launcher="$top/$(printf %s "${name:-$id}" | sed 's/: / - /g; s/[\\/:*?"<>|]//g').sh"
-printf '#!/bin/bash\nexec "$(dirname "$0")/pocket-native/run.sh" %s\n' "$id" > "$launcher"
-chmod +x "$launcher" "$pn/run.sh" "$pn/power.sh" "$pn/3ds.sh" "$pn/pocket-native"
-echo "== done: copy \"Pocket Native\" into roms/ports on the handheld's card"
+if [ -n "$handheld" ]; then
+    # FAT cards and Windows take no colons and a few other characters in a name
+    launcher="$top/$(printf %s "${name:-$id}" | sed 's/: / - /g; s/[\\/:*?"<>|]//g').sh"
+    printf '#!/bin/bash\nexec "$(dirname "$0")/pocket-native/run.sh" %s\n' "$id" > "$launcher"
+    chmod +x "$launcher" "$pn/run.sh" "$pn/power.sh" "$pn/3ds.sh" "$pn/pocket-native"
+    echo "== done: copy \"Pocket Native\" into roms/ports on the handheld's card"
+else
+    echo "== done: copy \"Pocket Native\" onto the device and add it in the app"
+fi

@@ -1,22 +1,25 @@
 #!/bin/bash
-# build.sh <rom>... [--keys aes_keys.txt] [--out dir] [--wait]
+# build.sh <rom>... [--keys aes_keys.txt] [--out dir] [--wait] [--32bit]
 #
 # Builds Pocket Native and games for the handheld from your own ROMs,
 # .3ds/.cci or .cia files, compressed (.zcci/.zcia) or not, with your
 # console's aes_keys.txt where they are encrypted, inside a container
 # (podman or docker). With no ROM it asks for them, and
-# --wait waits for Enter at the end. Leaves "Pocket Native" in the output
-# directory, build/ by default, to copy into roms/ports on the card.
+# --wait waits for Enter at the end. --32bit builds each game's code for a
+# 32-bit Android device instead, for the 32-bit app to play. Leaves
+# "Pocket Native" in the output directory, build/ by default, to copy into
+# roms/ports on the card.
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-roms=() keys="" out="$repo/build"
+roms=() keys="" out="$repo/build" bits=64
 while [ $# -gt 0 ]; do
     case "$1" in
         --keys) keys="$(realpath "$2")"; shift 2 ;;
         --out) out="$(realpath -m "$2")"; shift 2 ;;
         --wait) trap 'code=$?; read -rp "press Enter to close " _ || true; exit $code' EXIT; shift ;;
-        -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+        --32bit) bits=32; shift ;;
+        -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
         *) roms+=("$(realpath -m "$1")"); shift ;;
     esac
 done
@@ -36,7 +39,7 @@ if [ ${#roms[@]} -eq 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
     [ ${#roms[@]} -eq 0 ] && { echo "no game picked"; exit 2; }
 fi
 if [ ${#roms[@]} -eq 0 ]; then
-    echo "usage: scripts/build.sh <rom>... [--keys aes_keys.txt] [--out dir]"
+    echo "usage: scripts/build.sh <rom>... [--keys aes_keys.txt] [--out dir] [--32bit]"
     exit 2
 fi
 for rom in "${roms[@]}"; do
@@ -72,7 +75,7 @@ for rom in "${roms[@]}"; do
         mounts+=(-v "$(dirname "$rom_keys"):/keys:ro")
         args+=("/keys/$(basename "$rom_keys")")
     fi
-    "$engine" run --rm "${user[@]}" "${mounts[@]}" -e CARGO_HOME=/work/cargo -e CARGO_TARGET_DIR=/work/target -e HOME=/work \
+    "$engine" run --rm "${user[@]}" "${mounts[@]}" -e CARGO_HOME=/work/cargo -e CARGO_TARGET_DIR=/work/target -e HOME=/work -e BITS="$bits" \
         "$image" bash /src/scripts/container/inside.sh "${args[@]}" || failed+=("$rom")
 done
 bash "$repo/scripts/update.sh" --check || true
