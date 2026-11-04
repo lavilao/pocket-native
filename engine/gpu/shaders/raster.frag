@@ -125,8 +125,10 @@ layout(std430, set = 0, binding = 4) readonly buffer Tables {
     // 24 tables of 256 entries, a value and the step to the next, then the
     // procedural texture's noise, color map and alpha map, 128 entries
     // each, and its 256 colors and their steps, two pairs an entry, then
-    // the fog's 128, a value and a step
-    vec2 tables[];
+    // the fog's 128, a value and a step. sized, not unsized: some GLSL
+    // compilers (PowerVR UniFlex) crash compiling dynamic indexing into
+    // an unsized uniform array, and the size is fixed by the formats above
+    vec2 tables[7808];
 };
 
 const uint PROCTEX_MAPS = 24u * 256u;
@@ -379,64 +381,261 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
             distance = lookup(DISTANCE + number, uint(entry), place * 256.0 - entry);
         }
 
-        float values[7];
-        for (uint i = 0u; i < 7u; i++) {
-            values[i] = 1.0;
-            uvec4 l = lookups[i];
-            if (l.x == 0u || (i == 6u && (flags & 32u) == 0u)) {
-                continue;
+        // unrolled: a local array indexed in a loop is a known crash
+        // trigger for some GLSL compilers (PowerVR UniFlex), and the
+        // seven lookups have constant bounds so this is free
+        float v0 = 1.0;
+        {
+            uvec4 l = lookups[0];
+            if (l.x != 0u) {
+                float result = 0.0;
+                switch (l.y) {
+                    case 0u: result = dot(normal, half_unit); break;
+                    case 1u: result = dot(norm_view, half_unit); break;
+                    case 2u: result = dot(normal, norm_view); break;
+                    case 3u: result = dot(light_vector, normal); break;
+                    case 4u: result = dot(light_vector, light.spot.xyz); break;
+                    case 5u:
+                        if (config == 8u) {
+                            float along = dot(normal, half_unit);
+                            result = dot(half_unit - normal * along, tangent);
+                        }
+                        break;
+                    default: break;
+                }
+                uint entry;
+                float delta;
+                if (l.z != 0u) {
+                    result = two_sided ? abs(result) : max(result, 0.0);
+                    float e = clamp(floor(result * 256.0), 0.0, 255.0);
+                    entry = uint(e);
+                    delta = result * 256.0 - e;
+                } else {
+                    float e = clamp(floor(result * 128.0), -128.0, 127.0);
+                    entry = uint(int(e)) & 0xFFu;
+                    delta = result * 128.0 - e;
+                }
+                v0 = uintBitsToFloat(l.w) * lookup(DISTRIBUTION0, entry, delta);
             }
-            float result = 0.0;
-            switch (l.y) {
-                case 0u: result = dot(normal, half_unit); break;
-                case 1u: result = dot(norm_view, half_unit); break;
-                case 2u: result = dot(normal, norm_view); break;
-                case 3u: result = dot(light_vector, normal); break;
-                case 4u: result = dot(light_vector, light.spot.xyz); break;
-                case 5u:
-                    if (config == 8u) {
-                        float along = dot(normal, half_unit);
-                        result = dot(half_unit - normal * along, tangent);
-                    }
-                    break;
-                default: break;
+        }
+        float v1 = 1.0;
+        {
+            uvec4 l = lookups[1];
+            if (l.x != 0u) {
+                float result = 0.0;
+                switch (l.y) {
+                    case 0u: result = dot(normal, half_unit); break;
+                    case 1u: result = dot(norm_view, half_unit); break;
+                    case 2u: result = dot(normal, norm_view); break;
+                    case 3u: result = dot(light_vector, normal); break;
+                    case 4u: result = dot(light_vector, light.spot.xyz); break;
+                    case 5u:
+                        if (config == 8u) {
+                            float along = dot(normal, half_unit);
+                            result = dot(half_unit - normal * along, tangent);
+                        }
+                        break;
+                    default: break;
+                }
+                uint entry;
+                float delta;
+                if (l.z != 0u) {
+                    result = two_sided ? abs(result) : max(result, 0.0);
+                    float e = clamp(floor(result * 256.0), 0.0, 255.0);
+                    entry = uint(e);
+                    delta = result * 256.0 - e;
+                } else {
+                    float e = clamp(floor(result * 128.0), -128.0, 127.0);
+                    entry = uint(int(e)) & 0xFFu;
+                    delta = result * 128.0 - e;
+                }
+                v1 = uintBitsToFloat(l.w) * lookup(DISTRIBUTION1, entry, delta);
             }
-            uint entry;
-            float delta;
-            if (l.z != 0u) {
-                result = two_sided ? abs(result) : max(result, 0.0);
-                float e = clamp(floor(result * 256.0), 0.0, 255.0);
-                entry = uint(e);
-                delta = result * 256.0 - e;
-            } else {
-                // the signed index wraps into the upper half of the table
-                float e = clamp(floor(result * 128.0), -128.0, 127.0);
-                entry = uint(int(e)) & 0xFFu;
-                delta = result * 128.0 - e;
+        }
+        float v2 = 1.0;
+        {
+            uvec4 l = lookups[2];
+            if (l.x != 0u) {
+                float result = 0.0;
+                switch (l.y) {
+                    case 0u: result = dot(normal, half_unit); break;
+                    case 1u: result = dot(norm_view, half_unit); break;
+                    case 2u: result = dot(normal, norm_view); break;
+                    case 3u: result = dot(light_vector, normal); break;
+                    case 4u: result = dot(light_vector, light.spot.xyz); break;
+                    case 5u:
+                        if (config == 8u) {
+                            float along = dot(normal, half_unit);
+                            result = dot(half_unit - normal * along, tangent);
+                        }
+                        break;
+                    default: break;
+                }
+                uint entry;
+                float delta;
+                if (l.z != 0u) {
+                    result = two_sided ? abs(result) : max(result, 0.0);
+                    float e = clamp(floor(result * 256.0), 0.0, 255.0);
+                    entry = uint(e);
+                    delta = result * 256.0 - e;
+                } else {
+                    float e = clamp(floor(result * 128.0), -128.0, 127.0);
+                    entry = uint(int(e)) & 0xFFu;
+                    delta = result * 128.0 - e;
+                }
+                v2 = uintBitsToFloat(l.w) * lookup(FRESNEL, entry, delta);
             }
-            uint table = i == 0u ? DISTRIBUTION0
-                : i == 1u ? DISTRIBUTION1
-                : i == 2u ? FRESNEL
-                : i == 3u ? REFLECT_RED
-                : i == 4u ? REFLECT_GREEN
-                : i == 5u ? REFLECT_BLUE
-                : SPOTLIGHT + number;
-            values[i] = uintBitsToFloat(l.w) * lookup(table, entry, delta);
+        }
+        float v3 = 1.0;
+        {
+            uvec4 l = lookups[3];
+            if (l.x != 0u) {
+                float result = 0.0;
+                switch (l.y) {
+                    case 0u: result = dot(normal, half_unit); break;
+                    case 1u: result = dot(norm_view, half_unit); break;
+                    case 2u: result = dot(normal, norm_view); break;
+                    case 3u: result = dot(light_vector, normal); break;
+                    case 4u: result = dot(light_vector, light.spot.xyz); break;
+                    case 5u:
+                        if (config == 8u) {
+                            float along = dot(normal, half_unit);
+                            result = dot(half_unit - normal * along, tangent);
+                        }
+                        break;
+                    default: break;
+                }
+                uint entry;
+                float delta;
+                if (l.z != 0u) {
+                    result = two_sided ? abs(result) : max(result, 0.0);
+                    float e = clamp(floor(result * 256.0), 0.0, 255.0);
+                    entry = uint(e);
+                    delta = result * 256.0 - e;
+                } else {
+                    float e = clamp(floor(result * 128.0), -128.0, 127.0);
+                    entry = uint(int(e)) & 0xFFu;
+                    delta = result * 128.0 - e;
+                }
+                v3 = uintBitsToFloat(l.w) * lookup(REFLECT_RED, entry, delta);
+            }
+        }
+        float v4 = 1.0;
+        {
+            uvec4 l = lookups[4];
+            if (l.x != 0u) {
+                float result = 0.0;
+                switch (l.y) {
+                    case 0u: result = dot(normal, half_unit); break;
+                    case 1u: result = dot(norm_view, half_unit); break;
+                    case 2u: result = dot(normal, norm_view); break;
+                    case 3u: result = dot(light_vector, normal); break;
+                    case 4u: result = dot(light_vector, light.spot.xyz); break;
+                    case 5u:
+                        if (config == 8u) {
+                            float along = dot(normal, half_unit);
+                            result = dot(half_unit - normal * along, tangent);
+                        }
+                        break;
+                    default: break;
+                }
+                uint entry;
+                float delta;
+                if (l.z != 0u) {
+                    result = two_sided ? abs(result) : max(result, 0.0);
+                    float e = clamp(floor(result * 256.0), 0.0, 255.0);
+                    entry = uint(e);
+                    delta = result * 256.0 - e;
+                } else {
+                    float e = clamp(floor(result * 128.0), -128.0, 127.0);
+                    entry = uint(int(e)) & 0xFFu;
+                    delta = result * 128.0 - e;
+                }
+                v4 = uintBitsToFloat(l.w) * lookup(REFLECT_GREEN, entry, delta);
+            }
+        }
+        float v5 = 1.0;
+        {
+            uvec4 l = lookups[5];
+            if (l.x != 0u) {
+                float result = 0.0;
+                switch (l.y) {
+                    case 0u: result = dot(normal, half_unit); break;
+                    case 1u: result = dot(norm_view, half_unit); break;
+                    case 2u: result = dot(normal, norm_view); break;
+                    case 3u: result = dot(light_vector, normal); break;
+                    case 4u: result = dot(light_vector, light.spot.xyz); break;
+                    case 5u:
+                        if (config == 8u) {
+                            float along = dot(normal, half_unit);
+                            result = dot(half_unit - normal * along, tangent);
+                        }
+                        break;
+                    default: break;
+                }
+                uint entry;
+                float delta;
+                if (l.z != 0u) {
+                    result = two_sided ? abs(result) : max(result, 0.0);
+                    float e = clamp(floor(result * 256.0), 0.0, 255.0);
+                    entry = uint(e);
+                    delta = result * 256.0 - e;
+                } else {
+                    float e = clamp(floor(result * 128.0), -128.0, 127.0);
+                    entry = uint(int(e)) & 0xFFu;
+                    delta = result * 128.0 - e;
+                }
+                v5 = uintBitsToFloat(l.w) * lookup(REFLECT_BLUE, entry, delta);
+            }
+        }
+        float v6 = 1.0;
+        {
+            uvec4 l = lookups[6];
+            if (l.x != 0u && (flags & 32u) != 0u) {
+                float result = 0.0;
+                switch (l.y) {
+                    case 0u: result = dot(normal, half_unit); break;
+                    case 1u: result = dot(norm_view, half_unit); break;
+                    case 2u: result = dot(normal, norm_view); break;
+                    case 3u: result = dot(light_vector, normal); break;
+                    case 4u: result = dot(light_vector, light.spot.xyz); break;
+                    case 5u:
+                        if (config == 8u) {
+                            float along = dot(normal, half_unit);
+                            result = dot(half_unit - normal * along, tangent);
+                        }
+                        break;
+                    default: break;
+                }
+                uint entry;
+                float delta;
+                if (l.z != 0u) {
+                    result = two_sided ? abs(result) : max(result, 0.0);
+                    float e = clamp(floor(result * 256.0), 0.0, 255.0);
+                    entry = uint(e);
+                    delta = result * 256.0 - e;
+                } else {
+                    float e = clamp(floor(result * 128.0), -128.0, 127.0);
+                    entry = uint(int(e)) & 0xFFu;
+                    delta = result * 128.0 - e;
+                }
+                v6 = uintBitsToFloat(l.w) * lookup(SPOTLIGHT + number, entry, delta);
+            }
         }
 
-        float spot = values[6];
-        float red = values[3];
-        vec3 reflect_color = vec3(red, lookups[4].x != 0u ? values[4] : red, lookups[5].x != 0u ? values[5] : red);
-        vec3 specular0 = light.specular0.rgb * values[0];
-        vec3 specular1 = values[1] * reflect_color * light.specular1.rgb;
+        float spot = v6;
+        float red = v3;
+        vec3 reflect_color = vec3(red, lookups[4].x != 0u ? v4 : red, lookups[5].x != 0u ? v5 : red);
+        vec3 specular0 = light.specular0.rgb * v0;
+        vec3 specular1 = v1 * reflect_color * light.specular1.rgb;
 
         // only the last light applies fresnel
         if (slot == count - 1u && lookups[2].x != 0u) {
             if (light_flags.x != 0u) {
-                diffuse_sum.a = values[2];
+                diffuse_sum.a = v2;
             }
             if (light_flags.y != 0u) {
-                specular_sum.a = values[2];
+                specular_sum.a = v2;
             }
         }
 

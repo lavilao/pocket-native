@@ -6,6 +6,7 @@ pub mod hints;
 pub mod kernel;
 pub mod loader;
 pub mod memory;
+pub use memory::reserve_early;
 pub mod replay;
 pub mod recompiled;
 pub mod services;

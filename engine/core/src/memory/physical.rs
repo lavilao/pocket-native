@@ -56,22 +56,32 @@ impl Shared {
         // SAFETY: plain system calls, every result checked
         unsafe {
             let fd = libc::memfd_create(c"zakuro-physical".as_ptr(), libc::MFD_CLOEXEC);
-            if fd < 0 {
+            if fd >= 0 {
+                if libc::ftruncate(fd, len as libc::off_t) == 0 {
+                    let base = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+                    if base != libc::MAP_FAILED {
+                        return Some(Shared { fd, base: base as *mut u8, len });
+                    }
+                    log::warn!("physical memory: mmap({} bytes, shared) failed: {}", len, std::io::Error::last_os_error());
+                } else {
+                    log::warn!("physical memory: ftruncate({} bytes) failed: {}", len, std::io::Error::last_os_error());
+                }
+                libc::close(fd);
+            } else {
                 log::warn!("physical memory: memfd_create failed: {}", std::io::Error::last_os_error());
-                return None;
             }
-            if libc::ftruncate(fd, len as libc::off_t) != 0 {
-                log::warn!("physical memory: ftruncate({} bytes) failed: {}", len, std::io::Error::last_os_error());
-                libc::close(fd);
-                return None;
-            }
-            let base = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+            // fall back to plain anonymous memory: the memfd path can fail
+            // for reasons unrelated to the memory itself (kernel version,
+            // seccomp policy, file descriptor limits), and fastmem failing
+            // silently over that is worse than losing the shared-file
+            // properties, which nothing here depends on except `backing`
+            // reporting an fd — which callers already handle as optional.
+            let base = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
             if base == libc::MAP_FAILED {
-                log::warn!("physical memory: mmap({} bytes, shared) failed: {}", len, std::io::Error::last_os_error());
-                libc::close(fd);
+                log::warn!("physical memory: mmap({} bytes, anonymous) failed: {}", len, std::io::Error::last_os_error());
                 return None;
             }
-            Some(Shared { fd, base: base as *mut u8, len })
+            Some(Shared { fd: -1, base: base as *mut u8, len })
         }
     }
 
@@ -263,6 +273,12 @@ impl PhysicalMemory {
     /// memories are in one and the range is inside one of them.
     pub fn backing(&self, paddr: u32, size: u32) -> Option<(i32, u64)> {
         let shared = self.shared.as_ref()?;
+        // the anonymous fallback has no file to share through: the view
+        // cannot map pages from it, so fastmem stays off and the page
+        // tables take over. fastmem() returning null is the same signal
+        if shared.fd < 0 {
+            return None;
+        }
         let (base, store) = match paddr {
             p if (VRAM_PADDR..VRAM_PADDR + VRAM_SIZE).contains(&p) => (VRAM_PADDR, &self.vram),
             p if (DSP_RAM_PADDR..DSP_RAM_PADDR + DSP_RAM_SIZE).contains(&p) => (DSP_RAM_PADDR, &self.dsp_ram),

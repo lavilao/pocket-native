@@ -1027,6 +1027,22 @@ fn plain_multiplies(source: &str) -> String {
 }
 
 fn fragment_source(constants: &[u32; FRAGMENT_CONSTANTS], writes_depth: bool, lighting: &[u32]) -> String {
+    // the DYNAMIC stand-in: a tiny shader that just outputs the vertex
+    // color, used while a specialized program is still compiling. Some
+    // GLSL compilers (PowerVR UniFlex) crash compiling the full
+    // 758-line program with all its switches live, so the stand-in is
+    // deliberately trivial. Specialized programs never take this path.
+    if constants[29] != 0 {
+        let mut stand_in = String::from("#version 310 es\nprecision highp float;\nlayout(location = 0) in vec4 in_color;\nlayout(location = 0) out vec4 out_color;\nvoid main() { out_color = clamp(in_color, 0.0, 1.0); }\n");
+        if writes_depth {
+            stand_in.push_str("#define WRITES_DEPTH\n");
+        }
+        // still need the fragment depth output when requested
+        if writes_depth {
+            stand_in = "#version 310 es\nprecision highp float;\nlayout(location = 0) in vec4 in_color;\nlayout(location = 0) out vec4 out_color;\nlayout(location = 3) in float in_depth_w;\nlayout(location = 6) in float in_w;\nvoid main() { out_color = clamp(in_color, 0.0, 1.0); gl_FragDepth = in_depth_w / in_w; }\n".to_owned();
+        }
+        return stand_in;
+    }
     let mut out = String::from("#version 310 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n");
     if writes_depth {
         out.push_str("#define WRITES_DEPTH\n");
