@@ -15,6 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/lint-syscalls.sh
       - run: cargo build --release --locked
       - run: cargo test --release --locked --workspace --features zakuro-gpu/gles
 

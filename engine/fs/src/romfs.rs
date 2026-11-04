@@ -20,6 +20,11 @@ pub struct Level3Header {
 /// marker used by the metadata tables for "no such entry".
 pub const INVALID: u32 = 0xFFFF_FFFF;
 
+/// the most the directory and file tables together are read in at once.
+/// a game with more metadata than this is not one this parser serves,
+/// and the limit keeps a corrupt header from allocating gigabytes.
+const MAX_ROMFS_META: u64 = 64 << 20;
+
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub parent: u32,
@@ -74,6 +79,52 @@ impl RomFs {
         let ivfc = Reader::new(data).at(romfs_offset as usize)?;
         let level3_rel = Self::level3_offset(ivfc.bytes(0, ivfc.len().min(0x1000))?)?;
         Self::parse_level3(data, romfs_offset + level3_rel)
+    }
+
+    /// parses a RomFS out of a ROM image, reading only its IVFC header
+    /// and its level-3 tables rather than the whole image.
+    pub fn parse_from(image: &crate::RomImage, romfs_offset: u64) -> Result<RomFs, FsError> {
+        let ivfc_len = image.len().saturating_sub(romfs_offset).min(0x1000) as usize;
+        let ivfc = image.read_at(romfs_offset, ivfc_len)?;
+        let level3_rel = Self::level3_offset(&ivfc)?;
+        let base = romfs_offset + level3_rel;
+
+        let head = image.read_at(base, 0x28)?;
+        let r = Reader::new(&head);
+        if r.u32(0x00)? != 0x28 {
+            return Err(FsError::BadRomFs("level 3 header is not 0x28 bytes"));
+        }
+        let header = Level3Header {
+            dir_hash_offset: r.u32(0x04)?,
+            dir_hash_size: r.u32(0x08)?,
+            dir_meta_offset: r.u32(0x0C)?,
+            dir_meta_size: r.u32(0x10)?,
+            file_hash_offset: r.u32(0x14)?,
+            file_hash_size: r.u32(0x18)?,
+            file_meta_offset: r.u32(0x1C)?,
+            file_meta_size: r.u32(0x20)?,
+            file_data_offset: r.u32(0x24)?,
+        };
+
+        let dir_meta = image.read_bounded(
+            base + header.dir_meta_offset as u64,
+            header.dir_meta_size as u64,
+            MAX_ROMFS_META,
+            "a RomFS's directory table",
+        )?;
+        let file_meta = image.read_bounded(
+            base + header.file_meta_offset as u64,
+            header.file_meta_size as u64,
+            MAX_ROMFS_META,
+            "a RomFS's file table",
+        )?;
+
+        Ok(RomFs {
+            base,
+            header,
+            dir_meta,
+            file_meta,
+        })
     }
 
     /// parses an image that is already the level-3 directory structure, with no
