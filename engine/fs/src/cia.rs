@@ -23,10 +23,66 @@ pub struct Cia {
     pub executable: (u64, u64),
 }
 
+/// the most a title metadata can be: a signature, the header and 64
+/// content records. anything larger is not a TMD.
+const MAX_TMD: u64 = 1 << 20;
+
 impl Cia {
     /// returns true if data starts with a CIA header.
     pub fn detect(data: &[u8]) -> bool {
         data.len() >= HEADER_SIZE as usize && data[..4] == HEADER_SIZE.to_le_bytes()
+    }
+
+    /// parses a CIA out of a ROM image, reading only its header and its
+    /// title metadata rather than the whole archive.
+    pub fn parse_from(image: &crate::RomImage) -> Result<Cia, FsError> {
+        let header = image.read_at(0, HEADER_SIZE as usize)?;
+        let r = Reader::new(&header);
+        let align = |n: u64| n.next_multiple_of(ALIGN);
+        let certificates = r.u32(0x08)? as u64;
+        let ticket = r.u32(0x0C)? as u64;
+        let tmd_size = r.u32(0x10)? as u64;
+        let tmd_offset = align(align(align(HEADER_SIZE as u64) + certificates) + ticket);
+        let contents_offset = align(tmd_offset + tmd_size);
+
+        let tmd_bytes = image.read_bounded(tmd_offset, tmd_size, MAX_TMD, "a CIA's title metadata")?;
+        let tmd = Reader::new(&tmd_bytes);
+        // the signature's size goes by its type, padded to 64 bytes
+        let signature = match tmd.u32_be(0)? & 0xFFFF {
+            0x0000 | 0x0003 => 4 + 0x200 + 0x3C,
+            0x0001 | 0x0004 => 4 + 0x100 + 0x3C,
+            0x0002 | 0x0005 => 4 + 0x3C + 0x40,
+            _ => return Err(FsError::BadCia("unknown TMD signature type")),
+        };
+        let tmd = tmd.at(signature)?;
+        let title_id = tmd.u64_be(0x4C)?;
+        match title_id >> 32 {
+            0x0004_000E => return Err(FsError::NotAGame("an update")),
+            0x0004_008C => return Err(FsError::NotAGame("downloadable content")),
+            _ => {}
+        }
+
+        let present = |index: u16| {
+            let byte = r.u8(0x20 + index as usize / 8).unwrap_or(0);
+            byte & (0x80 >> (index % 8)) != 0
+        };
+        let mut offset = contents_offset;
+        for i in 0..tmd.u16_be(0x9E)? as usize {
+            let record = tmd.at(CONTENT_RECORDS + i * CONTENT_RECORD_SIZE)?;
+            let index = record.u16_be(0x04)?;
+            let size = record.u64_be(0x08)?;
+            if !present(index) {
+                continue;
+            }
+            if index == 0 {
+                if record.u16_be(0x06)? & CONTENT_ENCRYPTED != 0 {
+                    return Err(FsError::EncryptedCia);
+                }
+                return Ok(Cia { title_id, executable: (offset, size) });
+            }
+            offset = align(offset + size);
+        }
+        Err(FsError::NoExecutablePartition)
     }
 
     pub fn parse(data: &[u8]) -> Result<Cia, FsError> {

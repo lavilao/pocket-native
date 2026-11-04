@@ -1072,7 +1072,7 @@ fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
             }))
         }
         SELF_NCCH_CODE | SELF_NCCH_EXEFS => {
-            let data = title.exefs_file(".code")?.to_vec();
+            let data = title.exefs_file(".code")?;
             Some(system.services.fs.add_file(OpenFile {
                 path: "exefs:/.code".into(),
                 backing: FileBacking::Memory(data),
@@ -1132,25 +1132,25 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
             let Some(title) = system.title.as_ref() else {
                 return 0;
             };
-            let start = (base + offset) as usize;
-            let Some(slice) = title.image().data().get(start..start + count) else {
-                log::warn!("fs: read past the end of the ROM image");
-                return 0;
-            };
+            let start = base + offset;
             // copying through a temporary keeps the borrow of title from
             // overlapping the mutable borrow of memory.
             {
                 let mut blocks = ROM_BLOCKS.lock().unwrap();
                 let (seen, order) = &mut *blocks;
                 let seen = seen.get_or_insert_with(HashSet::new);
-                for block in start / ROM_BLOCK..=(start + count.max(1) - 1) / ROM_BLOCK {
-                    if seen.insert(block as u32) {
-                        order.push(block as u32);
+                let block = ROM_BLOCK as u64;
+                for index in start / block..=(start + count.max(1) as u64 - 1) / block {
+                    if seen.insert(index as u32) {
+                        order.push(index as u32);
                     }
                 }
             }
             let started = std::time::Instant::now();
-            let data = slice.to_vec();
+            let Ok(data) = title.image().read_at(start, count) else {
+                log::warn!("fs: read past the end of the ROM image");
+                return 0;
+            };
             ROM_READS[0].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             ROM_READS[1].fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
             system.memory.write_bytes(dest, &data);
