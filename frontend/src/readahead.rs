@@ -15,9 +15,14 @@ fn read_ahead(path: &str, blocks: Vec<u32>) {
     let Ok(file) = std::fs::File::open(path) else { return };
     std::thread::spawn(move || {
         use std::os::unix::fs::FileExt;
-        // SAFETY: plain calls that lower this thread's own priorities
+        // SAFETY: plain calls that lower this thread's own priorities.
+        // ioprio_set stays off Android: its seccomp filter kills the
+        // process with SIGSYS on a blocked syscall instead of returning
+        // an error, so there is no failure to fall back on there. nice
+        // goes through setpriority, which Android allows.
         unsafe {
             libc::nice(19);
+            #[cfg(not(target_os = "android"))]
             libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13);
         }
         let started = Instant::now();
@@ -43,6 +48,8 @@ impl ReadAhead {
     pub fn start(rom: &str, data: &Path, read: bool) -> ReadAhead {
         let path = data.join("rom-blocks");
         let earlier: Vec<u32> = std::fs::read(&path).unwrap_or_default().as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
+        // POCKET_NO_READAHEAD=1 turns the background reads off entirely.
+        let read = read && std::env::var("POCKET_NO_READAHEAD").map(|v| v != "1").unwrap_or(true);
         if read {
             read_ahead(rom, earlier.clone());
         } else {
