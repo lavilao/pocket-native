@@ -102,6 +102,12 @@ unsafe impl Send for Memory {}
 
 impl Memory {
     pub fn new(new3ds: bool, app_bytes: u32) -> Memory {
+        // the view first, while the process still has its biggest clear
+        // stretch of address space: on a 32-bit host the 1 GiB reservation
+        // is the hardest mapping to place, harder than the shared file's
+        // few hundred MiB, and this runs before EGL and the game's threads
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let view = fastmem::View::new();
         Memory {
             phys: PhysicalMemory::new(new3ds, app_bytes),
             read_table: vec![std::ptr::null_mut(); PAGE_TABLE_ENTRIES],
@@ -110,7 +116,7 @@ impl Memory {
             faults: BTreeMap::new(),
             new_fault: None,
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            view: fastmem::View::new(),
+            view,
             linear_base: 0,
         }
     }
@@ -143,6 +149,12 @@ impl Memory {
         if let (Some(view), true) = (&self.view, self.phys.backing(FCRAM_PADDR, PAGE_SIZE).is_some()) {
             return view.base();
         }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        log::warn!(
+            "fastmem: no view for recompiled code (view: {}, shared backing: {})",
+            self.view.is_some(),
+            self.phys.backing(FCRAM_PADDR, PAGE_SIZE).is_some()
+        );
         std::ptr::null_mut()
     }
 

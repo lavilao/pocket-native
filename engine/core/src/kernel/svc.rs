@@ -310,13 +310,11 @@ fn map_memory_block(system: &mut System) {
         return;
     };
 
-    let (paddr, size) = (block.paddr, block.size);
-    let font = system.services.apt.shared_font.filter(|_| block.name == "SharedFont").map(|(at, _)| at);
-    let addr = if addr == 0 && font.is_some() {
-        // the font at its linear address, where APT relocated it: its glyph
-        // sheets are textures, which the GPU reaches by that address's
-        // physical one, and anywhere else Kid Icarus drew its text as boxes
-        font.unwrap_or_default()
+    let (paddr, size, own) = (block.paddr, block.size, block.address);
+    let addr = if addr == 0 && own != 0 {
+        // a block the system keeps somewhere, as the shared font, goes where
+        // it already is, the address the title was told
+        own
     } else if addr == 0 {
         // let the kernel choose, the first place in the shared memory region
         // the whole block fits, a big one mapped over the next block along

@@ -702,8 +702,18 @@ pub(super) fn fragment_source(constants: &[u32; FRAGMENT_CONSTANTS], writes_dept
             ("in vec4 in_view", "in highp vec4 in_view"),
             ("in float in_depth_w", "in highp float in_depth_w"),
             ("in float in_w", "in highp float in_w"),
-            ("sample_unit(uint unit, vec2 uv)", "sample_unit(uint unit, highp vec2 uv)"),
+            // the coordinates that place texels stay full: sample_st hands
+            // them back, so its return type is marked as well as its own
+            // parameter and the sample_unit that takes it along
+            ("vec2 sample_st(uint unit, vec2 uv)", "highp vec2 sample_st(uint unit, highp vec2 uv)"),
+            ("sample_unit(uint unit, vec2 uv, vec4", "sample_unit(uint unit, highp vec2 uv, vec4"),
             ("    vec2 st = ", "    highp vec2 st = "),
+            ("    vec2 st0 = ", "    highp vec2 st0 = "),
+            ("    vec2 st1 = ", "    highp vec2 st1 = "),
+            ("    vec2 st2 = ", "    highp vec2 st2 = "),
+            // and the level of detail bias fed to texture(): a 256th of a
+            // level is below what mediump keeps
+            ("    float bias", "    highp float bias"),
             ("    float depth = in_depth", "    highp float depth = in_depth"),
             ("    vec3 view = in_view.xyz", "    highp vec3 view = in_view.xyz"),
             ("vec3 offset = -view", "highp vec3 offset = -view"),

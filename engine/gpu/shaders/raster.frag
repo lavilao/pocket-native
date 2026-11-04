@@ -153,16 +153,24 @@ vec4 unpack_color(uint value) {
 // texture configuration constant tells, bit 16 on for each unit in place
 // and bit 20 for each that never clamps to the border, the generic pipeline
 // reads both from the unit
-vec4 sample_unit(uint unit, vec2 uv) {
+vec2 sample_st(uint unit, vec2 uv) {
+    uint config = units[unit].x;
+    bool in_place = DYNAMIC != 0u ? (units[unit].z & 1u) != 0u : (TEXTURE_CONFIG & (0x10000u << unit)) != 0u;
+    // precise as the combiners are. the coordinate itself the driver may
+    // still interpolate a hair apart from one shader to another
+    vec2 st = vec2(uv.x, in_place ? uv.y : 1.0 - uv.y);
+    return st;
+}
+
+// a unit's sample from the values main already fetched. selection only, no
+// texture call: texture() needs implicit derivatives, which are undefined
+// outside uniform flow, and some drivers (PowerVR) refuse to compile it
+// under a branch at all, so every fetch happens unconditionally in main.
+vec4 sample_unit(uint unit, vec2 uv, vec4 t0, vec4 t1, vec4 t2, vec4 a0, vec4 a1, vec4 a2) {
     uint config = units[unit].x;
     uint wrap_t = (config >> 8) & 7u;
     uint wrap_s = (config >> 12) & 7u;
-    bool in_place = DYNAMIC != 0u ? (units[unit].z & 1u) != 0u : (TEXTURE_CONFIG & (0x10000u << unit)) != 0u;
-    // the unit's level of detail bias, in 256ths in the word's top half
-    float bias = float(int(units[unit].z) >> 16) / 256.0;
-    // precise as the combiners are. the coordinate itself the driver may
-    // still interpolate a hair apart from one shader to another
-    precise vec2 st = vec2(uv.x, in_place ? uv.y : 1.0 - uv.y);
+    vec2 st = sample_st(unit, uv);
     if (DYNAMIC != 0u || (TEXTURE_CONFIG & (0x100000u << unit)) == 0u) {
         bool border_s = (wrap_s & 3u) == 1u && (st.x < 0.0 || st.x >= 1.0);
         bool border_t = (wrap_t & 3u) == 1u && (st.y < 0.0 || st.y >= 1.0);
@@ -172,19 +180,9 @@ vec4 sample_unit(uint unit, vec2 uv) {
     }
     // bit 24 on for each unit with its alpha apart
     if (DYNAMIC != 0u ? units[unit].w != 0u : (TEXTURE_CONFIG & (0x1000000u << unit)) != 0u) {
-        if (unit == 0u) {
-            return vec4(texture(texture0, st, bias).rgb, texture(alpha0, st, bias).r);
-        } else if (unit == 1u) {
-            return vec4(texture(texture1, st, bias).rgb, texture(alpha1, st, bias).r);
-        }
-        return vec4(texture(texture2, st, bias).rgb, texture(alpha2, st, bias).r);
+        return unit == 0u ? a0 : unit == 1u ? a1 : a2;
     }
-    if (unit == 0u) {
-        return texture(texture0, st, bias);
-    } else if (unit == 1u) {
-        return texture(texture1, st, bias);
-    }
-    return texture(texture2, st, bias);
+    return unit == 0u ? t0 : unit == 1u ? t1 : t2;
 }
 
 precise float lookup(uint table, uint entry, float delta) {
@@ -673,16 +671,32 @@ void main() {
     // set 1 instead of its own
     uint texture_config = DYNAMIC != 0u ? (misc.w & 0x2307u) | (TEXTURE_CONFIG & 0x400u) : TEXTURE_CONFIG;
     vec4 textures[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));
+    // every fetch happens unconditionally, before any branch, so that
+    // texture()'s implicit derivatives stay in uniform flow (see
+    // sample_unit). the level of detail bias is the top half of the in
+    // place word, in 256ths, and unit 0 may be projected: its coordinates
+    // divided by set 0's w
+    float bias0 = float(int(units[0].z) >> 16) / 256.0;
+    float bias1 = float(int(units[1].z) >> 16) / 256.0;
+    float bias2 = float(int(units[2].z) >> 16) / 256.0;
+    bool projected = DYNAMIC != 0u ? ((units[0].x >> 28) & 7u) == 3u : (TEXTURE_CONFIG & 0x10000000u) != 0u;
+    vec2 st0 = sample_st(0u, projected ? in_texcoords01.xy / in_view.w : in_texcoords01.xy);
+    vec2 st1 = sample_st(1u, in_texcoords01.zw);
+    vec2 st2 = sample_st(2u, (texture_config & (1u << 13)) != 0u ? in_texcoords01.zw : in_texcoord2);
+    vec4 t0 = texture(texture0, st0, bias0);
+    vec4 t1 = texture(texture1, st1, bias1);
+    vec4 t2 = texture(texture2, st2, bias2);
+    vec4 a0 = vec4(t0.rgb, texture(alpha0, st0, bias0).r);
+    vec4 a1 = vec4(t1.rgb, texture(alpha1, st1, bias1).r);
+    vec4 a2 = vec4(t2.rgb, texture(alpha2, st2, bias2).r);
     if ((texture_config & 1u) != 0u) {
-        // a projected unit 0 divides its coordinates by set 0's w
-        bool projected = DYNAMIC != 0u ? ((units[0].x >> 28) & 7u) == 3u : (TEXTURE_CONFIG & 0x10000000u) != 0u;
-        textures[0] = sample_unit(0u, projected ? in_texcoords01.xy / in_view.w : in_texcoords01.xy);
+        textures[0] = sample_unit(0u, projected ? in_texcoords01.xy / in_view.w : in_texcoords01.xy, t0, t1, t2, a0, a1, a2);
     }
     if ((texture_config & 2u) != 0u) {
-        textures[1] = sample_unit(1u, in_texcoords01.zw);
+        textures[1] = sample_unit(1u, in_texcoords01.zw, t0, t1, t2, a0, a1, a2);
     }
     if ((texture_config & 4u) != 0u) {
-        textures[2] = sample_unit(2u, (texture_config & (1u << 13)) != 0u ? in_texcoords01.zw : in_texcoord2);
+        textures[2] = sample_unit(2u, (texture_config & (1u << 13)) != 0u ? in_texcoords01.zw : in_texcoord2, t0, t1, t2, a0, a1, a2);
     }
     if ((texture_config & (1u << 10)) != 0u) {
         uint set = min((texture_config >> 8) & 3u, 2u);
