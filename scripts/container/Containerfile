@@ -1,8 +1,10 @@
 # the build environment: Ubuntu 18.04, whose C library is old enough for the
-# handhelds' systems, with the ARM64 cross compiler, Rust and Python
+# handhelds' systems, with the ARM64 and ARM32 cross compilers, Rust and
+# Python
 FROM docker.io/library/ubuntu:18.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         gcc g++ libc6-dev gcc-aarch64-linux-gnu gcc-8-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu \
+        gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
         make pkg-config ca-certificates curl zstd python3 python3-pip python3-setuptools \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --no-cache-dir pycryptodomex

@@ -20,7 +20,8 @@ Before you start, check [which games work](docs/compatibility.md) and
 - **A device:**
   - a Linux handheld from the [list](README.md#handhelds), or
   - an Android phone or handheld with Android 11 or newer, 64-bit (almost
-    any from the last few years)
+    any from the last few years). A 32-bit one works too: it needs the
+    32-bit app, and its games built with `--32bit`
 - **A PC** with Windows or Linux. It does the heavy work, your device
   never builds anything.
   - Windows: Docker Desktop or Podman Desktop. If neither is
@@ -107,7 +108,9 @@ ArkOS), and your games are under Ports.
    allow installing apps from your browser or file manager.
 2. **Copy your games over.** Copy the `Pocket Native` folder from the
    kit's `build` folder onto the device, for example into `Download`
-   over USB.
+   over USB. On a 32-bit device, build them with
+   `scripts/build.sh --32bit` (`-Bit32` on Windows), so the games' code
+   is 32-bit too.
 3. **Add them in the app.** Tap **Add game**, pick **A folder the kit
    built**, choose that `Pocket Native` folder, tap **Use this folder**
    and **Allow**. The app adds every game it finds in there, so one go
