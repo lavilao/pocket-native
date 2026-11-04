@@ -57,14 +57,17 @@ impl Shared {
         unsafe {
             let fd = libc::memfd_create(c"zakuro-physical".as_ptr(), libc::MFD_CLOEXEC);
             if fd < 0 {
+                log::warn!("physical memory: memfd_create failed: {}", std::io::Error::last_os_error());
                 return None;
             }
             if libc::ftruncate(fd, len as libc::off_t) != 0 {
+                log::warn!("physical memory: ftruncate({} bytes) failed: {}", len, std::io::Error::last_os_error());
                 libc::close(fd);
                 return None;
             }
             let base = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
             if base == libc::MAP_FAILED {
+                log::warn!("physical memory: mmap({} bytes, shared) failed: {}", len, std::io::Error::last_os_error());
                 libc::close(fd);
                 return None;
             }

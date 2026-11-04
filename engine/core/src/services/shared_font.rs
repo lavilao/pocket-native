@@ -24,6 +24,9 @@ const SHEET_WIDTH: u16 = 256;
 const SHEET_HEIGHT: u16 = 256;
 /// 4-bit alpha, the format a real shared font's sheets use.
 const SHEET_FORMAT_A4: u16 = 11;
+/// the GPU takes a texture's address in 8-byte steps, a console's font has
+/// its sheets further aligned, to 128 bytes.
+const SHEET_ALIGN: u32 = 0x80;
 
 /// characters the map covers, printable ASCII.
 const CODE_BEGIN: u16 = 0x20;
@@ -43,7 +46,7 @@ pub fn build(base: u32) -> Vec<u8> {
 
     let finf_at = FONT_OFFSET + CFNT_SIZE;
     let tglp_at = finf_at + FINF_SIZE;
-    let sheet_at = tglp_at + TGLP_HEADER_SIZE;
+    let sheet_at = align_up(tglp_at + TGLP_HEADER_SIZE, SHEET_ALIGN);
     let cwdh_at = sheet_at + sheet_size;
     let cwdh_size = CWDH_HEADER_SIZE + align_up(glyphs * 3, 4);
     let cmap_at = cwdh_at + cwdh_size;
@@ -89,7 +92,7 @@ pub fn build(base: u32) -> Vec<u8> {
 
     // TGLP, the sheet the glyph images live in.
     write_magic(&mut out, tglp_at, b"TGLP");
-    put32(&mut out, tglp_at + 4, TGLP_HEADER_SIZE + sheet_size);
+    put32(&mut out, tglp_at + 4, sheet_at - tglp_at + sheet_size);
     out[tglp_at as usize + 8] = CELL_WIDTH;
     out[tglp_at as usize + 9] = CELL_HEIGHT;
     out[tglp_at as usize + 10] = CELL_HEIGHT - GLYPH_SCALE as u8; // baseline
@@ -144,40 +147,56 @@ pub fn relocate(memory: &mut crate::memory::Memory, block: u32, paddr: u32) {
 
     let header_size = memory.read16(header + 6) as u32;
     let sections = memory.read32(header + 16);
-    let mut found = Vec::new();
+
+    let (mut finf, mut tglp) = (None, None);
     let mut at = header + header_size;
-    for _ in 0..sections.min(4096) {
+    for _ in 0..sections.min(16) {
         let mut magic = [0u8; 4];
         memory.read_bytes(at, &mut magic);
         let size = memory.read32(at + 4);
-        if !matches!(&magic, b"FINF" | b"TGLP" | b"CWDH" | b"CMAP") || size == 0 {
+        match &magic {
+            b"FINF" => finf = finf.or(Some(at)),
+            b"TGLP" => tglp = tglp.or(Some(at)),
+            _ => {}
+        }
+        if size == 0 || (finf.is_some() && tglp.is_some()) {
             break;
         }
-        found.push((magic, at));
         at += size;
     }
+    let (Some(finf), Some(tglp)) = (finf, tglp) else { return };
 
-    let Some(&(_, finf)) = found.iter().find(|(magic, _)| magic == b"FINF") else { return };
-    let Some(&(_, tglp)) = found.iter().find(|(magic, _)| magic == b"TGLP") else { return };
-    let shift = (tglp + SECTION_BODY).wrapping_sub(memory.read32(finf + 16));
+    // FINF's pointer to TGLP tells where the block was laid out for
+    let laid_out = memory.read32(finf + 16).wrapping_sub(tglp - block + SECTION_BODY);
+    let delta = block.wrapping_sub(laid_out);
+    if delta == 0 {
+        return;
+    }
     // the block is mapped read-only, so the edits go to the physical pages
     // behind it rather than through the guest's view of them.
-    let mut moved = |at: u32| {
+    let moved = |memory: &mut crate::memory::Memory, at: u32| -> u32 {
         let pointer = memory.read32(at);
-        if pointer != 0 {
-            memory.write_physical(paddr + (at - block), &pointer.wrapping_add(shift).to_le_bytes());
-        }
+        let moved = pointer.wrapping_add(delta);
+        memory.write_physical(paddr + (at - block), &moved.to_le_bytes());
+        moved
     };
-    for &(magic, section) in &found {
-        match &magic {
-            b"FINF" => [16, 20, 24].into_iter().for_each(|field| moved(section + field)),
-            b"TGLP" => moved(section + 28),
-            b"CWDH" => moved(section + 12),
-            _ => moved(section + 16),
+    // FINF's three, the sheet's, then the widths and maps chained on, each
+    // pointing at the body of the next past its magic and size
+    for field in [16, 20, 24] {
+        moved(memory, finf + field);
+    }
+    moved(memory, tglp + 28);
+    for (first, link) in [(finf + 20, 4), (finf + 24, 8)] {
+        let mut body = memory.read32(first);
+        for _ in 0..256 {
+            if memory.read32(body + link) == 0 {
+                break;
+            }
+            body = moved(memory, body + link);
         }
     }
 
-    log::debug!("relocated the shared font's sections for its mapping at 0x{block:08X}");
+    log::debug!("relocated the shared font for its mapping at 0x{block:08X}");
 }
 
 /// paints each character's bitmap into its cell on the glyph sheet.
@@ -247,6 +266,16 @@ mod tests {
 
     fn read32(data: &[u8], at: u32) -> u32 {
         u32::from_le_bytes(data[at as usize..at as usize + 4].try_into().unwrap())
+    }
+
+    /// the sheet is where the GPU can be pointed at, an address it takes in
+    /// 8-byte steps. one 4 bytes off had it read every glyph shifted.
+    #[test]
+    fn the_glyph_sheet_is_aligned() {
+        let base = 0x1800_0000;
+        let font = build(base);
+        let tglp = read32(&font, FONT_OFFSET + 0x14 + 16) - base;
+        assert_eq!(read32(&font, tglp + 20) % SHEET_ALIGN, 0);
     }
 
     /// walks the block the way a title's font loader does, check the status,

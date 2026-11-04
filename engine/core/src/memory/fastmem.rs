@@ -49,12 +49,14 @@ impl View {
             )
         };
         if base == libc::MAP_FAILED {
+            log::warn!("fastmem: could not reserve {} MiB of address space: {}", SPAN >> 20, std::io::Error::last_os_error());
             return None;
         }
         let base = base as *mut u8;
         let Some(slot) = VIEWS.iter().position(|view| view.compare_exchange(0, base as usize, Ordering::AcqRel, Ordering::Acquire).is_ok()) else {
             // SAFETY: the reservation just made
             unsafe { libc::munmap(base as *mut libc::c_void, SPAN) };
+            log::warn!("fastmem: all {} views are taken", SLOTS);
             return None;
         };
         Some(View { base, slot })

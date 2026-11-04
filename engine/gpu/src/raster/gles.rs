@@ -1067,7 +1067,7 @@ fn fragment_source(constants: &[u32; FRAGMENT_CONSTANTS], writes_depth: bool, li
             ("in vec3 in_view", "in highp vec3 in_view"),
             ("in float in_depth_w", "in highp float in_depth_w"),
             ("in float in_w", "in highp float in_w"),
-            ("sample_unit(uint unit, vec2 uv)", "sample_unit(uint unit, highp vec2 uv)"),
+            ("sample_unit(uint unit, vec2 uv, vec4", "sample_unit(uint unit, highp vec2 uv, vec4"),
             ("    vec2 st = ", "    highp vec2 st = "),
             ("    float depth = in_depth", "    highp float depth = in_depth"),
             ("    vec3 view = in_view", "    highp vec3 view = in_view"),
