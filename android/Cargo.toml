@@ -14,6 +14,7 @@ crate-type = ["cdylib"]
 
 [target.'cfg(target_os = "android")'.dependencies]
 pocket-native = { path = "../frontend" }
+zakuro-core.workspace = true
 zakuro-gpu.workspace = true
 log.workspace = true
 android-activity = { version = "0.6.1", features = ["native-activity"] }
