@@ -792,6 +792,7 @@ dependencies = [
  "jni 0.21.1",
  "log",
  "pocket-native",
+ "zakuro-core",
  "zakuro-gpu",
 ]
 
