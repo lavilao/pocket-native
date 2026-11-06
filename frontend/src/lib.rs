@@ -102,8 +102,6 @@ pub fn run(mut args: Vec<String>) {
         probe::start_logging();
         crash::watch(None);
     } else {
-        #[cfg(target_os = "android")]
-        android_logger::init_once(android_logger::Config::default().with_tag("pocketnative"));
         let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
         // POCKET_NATIVE_LOG=file logs there in place of standard error, which
         // goes nowhere in an Android app
@@ -112,7 +110,13 @@ pub fn run(mut args: Vec<String>) {
         if let Some(file) = file {
             logger.target(env_logger::Target::Pipe(Box::new(file)));
         }
-        logger.init();
+        // on Android, mirror to logcat under the "pocketnative" tag so
+        // `adb logcat -s pocketnative` shows it (only reads the file
+        // otherwise). init_once is a no-op if a logger is already set,
+        // so it must come after env_logger's init: it can't double-set.
+        logger.try_init().expect("Pocket Native's logger should not be set twice");
+        #[cfg(target_os = "android")]
+        android_logger::init_once(android_logger::Config::default().with_tag("pocketnative"));
         log::info!("Pocket Native {} (git {})", env!("CARGO_PKG_VERSION"), git_hash());
         crash::watch(crash_log);
         // a note from a program around the frontend, which has no log of its own
