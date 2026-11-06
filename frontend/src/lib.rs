@@ -94,12 +94,15 @@ fn apply_power(power: Power) {
 
 /// runs the frontend with the program's arguments, the ROM first, or
 /// --probe, the ROM and frames. Ends the process when the game is done.
+fn git_hash() -> &'static str { option_env!("GIT_HASH").unwrap_or("unknown") }
 pub fn run(mut args: Vec<String>) {
     let probing = args.first().is_some_and(|arg| arg == "--probe");
     if probing {
         args.remove(0);
         probe::start_logging();
     } else {
+        #[cfg(target_os = "android")]
+        android_logger::init_once(android_logger::Config::default().with_tag("pocketnative"));
         let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
         // POCKET_NATIVE_LOG=file logs there in place of standard error, which
         // goes nowhere in an Android app
@@ -109,6 +112,7 @@ pub fn run(mut args: Vec<String>) {
             logger.target(env_logger::Target::Pipe(Box::new(file)));
         }
         logger.init();
+        log::info!("Pocket Native {} (git {})", env!("CARGO_PKG_VERSION"), git_hash());
         crash::watch(crash_log);
         // a note from a program around the frontend, which has no log of its own
         if let Ok(note) = std::env::var("POCKET_NATIVE_NOTE") {
@@ -550,6 +554,9 @@ pub fn run(mut args: Vec<String>) {
             fps += 1;
             let second = fps_since.elapsed() >= Duration::from_secs(1);
             if second {
+                log::info!("fps={last_fps} building={} shaders_compiled={} recompiled={} fallbacks={}",
+                    zakuro_gpu::compiling(), zakuro_gpu::shader_compiles(),
+                    system.recompiled.is_some(), system.recompiled.as_ref().map(|l| l.fallbacks()).unwrap_or(0));
                 (last_fps, fps, fps_since) = (fps, 0, Instant::now());
             }
             let said = note.filter(|(_, at)| at.elapsed() < Duration::from_secs(2)).map(|(said, _)| said);

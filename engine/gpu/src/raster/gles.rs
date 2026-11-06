@@ -1820,6 +1820,9 @@ unsafe fn draw_overlay(gl: &glow::Context, panel: &mut Panel, overlay: &crate::O
 /// held while the GL thread or the compiler thread compiles: Mali's driver
 /// on the RX6H crashed in the compiler thread with both at it.
 static COMPILER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SHADER_COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub fn shader_compiles() -> usize { SHADER_COMPILES.load(std::sync::atomic::Ordering::Relaxed) }
+pub fn reset_shader_compiles() { SHADER_COMPILES.store(0, std::sync::atomic::Ordering::Relaxed) }
 
 fn link(gl: &glow::Context, vertex: &str, fragment: &str) -> Result<glow::Program, String> {
     let _compiling = COMPILER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3573,7 +3576,27 @@ type ProgramKey = ([u32; FRAGMENT_CONSTANTS], bool, Vec<u32>, u64);
 
 /// compiles and links a program, or loads it from the program binary cache
 /// when it was made before, its samplers on the texture units.
-fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, cached: Option<&std::path::Path>) -> Result<glow::Program, String> {
+fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, cached: Option<&std::path::Path>, key: &ProgramKey) -> Result<glow::Program, String> {
+    // marker file: variant name before compile, removed on success.
+    // If the driver segfaults (UniFlex 0x3f80025c), the marker survives;
+    // next run sees it and skips that variant (uses DYNAMIC stand-in).
+    let _marker = std::env::var_os("ZAKURO_DATA").map(std::path::PathBuf::from).map(|d| d.join("shader_marker.txt"));
+    let marker_data = std::env::var_os("ZAKURO_DATA").map(std::path::PathBuf::from);
+    if let Some(d) = &marker_data {
+        let m = d.join("shader_marker.txt");
+        if m.exists() {
+            if let Ok(prev) = std::fs::read_to_string(&m) {
+                let bad: std::collections::HashSet<String> = std::fs::read_to_string(d.join("shader_bad.txt")).unwrap_or_default().lines().map(str::to_string).collect();
+                if !bad.contains(prev.trim()) {
+                    let mut bad = bad; bad.insert(prev.trim().to_string());
+                    let _ = std::fs::write(d.join("shader_bad.txt"), bad.into_iter().collect::<Vec<_>>().join("\n"));
+                    log::warn!("shader: variant {} killed the driver last run, marking bad", prev.trim());
+                }
+            }
+        }
+        let _ = std::fs::write(&m, format!("{:?}", key));
+    }
+    SHADER_COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let started = std::time::Instant::now();
     let _compiling = COMPILER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     // SAFETY: the context is current on this thread, the shaders are deleted
@@ -3624,6 +3647,7 @@ fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, cached: Optio
             }
         }
         log::debug!("program {} in {:.1} ms", if loaded { "loaded" } else { "compiled" }, started.elapsed().as_secs_f64() * 1000.0);
+        if let Some(d) = &marker_data { let _ = std::fs::remove_file(d.join("shader_marker.txt")); }
         Ok(program)
     }
 }
@@ -3667,7 +3691,7 @@ impl Compiler {
                 unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
                 let _ = ready.send(true);
                 for job in received {
-                    let result = build_program(&gl, &job.vertex, &job.fragment, job.cached.as_deref());
+                    let result = build_program(&gl, &job.vertex, &job.fragment, job.cached.as_deref(), &job.key);
                     // SAFETY: the context is current on this thread
                     unsafe { gl.finish() };
                     BUILDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -5260,12 +5284,12 @@ impl Gles {
             return worker.run(|| self.program(constants, writes_depth, lighting, vertex, wait, None));
         }
         disturb();
-        let program = match build_program(&self.gl, &compiled, &fragment, cached.as_deref()) {
+        let program = match build_program(&self.gl, &compiled, &fragment, cached.as_deref(), &key) {
             Ok(program) => program,
             Err(error) if self.retried.insert(key.clone()) => {
                 log::warn!("{error}");
                 self.make_room();
-                build_program(&self.gl, &compiled, &fragment, cached.as_deref())?
+                build_program(&self.gl, &compiled, &fragment, cached.as_deref(), &key)?
             }
             Err(error) => return Err(error),
         };
