@@ -15,8 +15,11 @@ package="$1" label="$2" engine="$3" assets="$4" out="$5" keystore="$6" abi="${7:
 pass="${KEYSTORE_PASS:-android}"
 here="$(cd "$(dirname "$0")" && pwd)"
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$here/../../Cargo.toml" | head -1)
+githash=$(git -C "$here/../.." rev-parse --short HEAD 2>/dev/null || echo unknown)
+version="$version+$githash"
 # a version code from the version, 0.3.0 as 3000
-IFS=. read -r major minor patch <<< "$version"
+codebase=${version%%+*}
+IFS=. read -r major minor patch <<< "$codebase"
 code=$((major * 1000000 + minor * 1000 + patch))
 
 work=$(mktemp -d)

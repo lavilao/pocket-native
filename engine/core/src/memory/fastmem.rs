@@ -33,6 +33,25 @@ static mut PREVIOUS: Option<libc::sigaction> = None;
 /// (base, slot) once set; 0 means no early reservation.
 static EARLY_BASE: AtomicUsize = AtomicUsize::new(0);
 static EARLY_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
+static NEW_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn new_calls() -> usize { NEW_CALLS.load(Ordering::Relaxed) }
+
+fn log_maps_gap(ctx: &str) {
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { return };
+    let mut best = 0usize;
+    let mut total = 0usize;
+    for line in maps.lines() {
+        let Some(range) = line.split_whitespace().next() else { continue };
+        let Some((s, e)) = range.split_once('-') else { continue };
+        let Ok(s) = usize::from_str_radix(s, 16) else { continue };
+        let Ok(e) = usize::from_str_radix(e, 16) else { continue };
+        if e >= s { best = best.max(e - s); total += e - s; }
+    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let vm = status.lines().filter(|l| l.starts_with("VmSize") || l.starts_with("VmPeak")).collect::<Vec<_>>().join(", ");
+    log::warn!("fastmem: {ctx}: largest free hole {best} bytes ({} MiB), mapped total {} MiB, {vm}", best >> 20, total >> 20);
+}
 
 pub struct View {
     base: *mut u8,
@@ -60,6 +79,7 @@ pub fn reserve_early() {
     };
     if base == libc::MAP_FAILED {
         log::warn!("fastmem: early reservation of {} MiB failed: {}", SPAN >> 20, std::io::Error::last_os_error());
+        log_maps_gap("reserve_early failed");
         return;
     }
     let base = base as usize;
@@ -76,6 +96,7 @@ pub fn reserve_early() {
 impl View {
     /// a view with nothing mapped, none when the host cannot have one.
     pub fn new() -> Option<View> {
+        NEW_CALLS.fetch_add(1, Ordering::Relaxed);
         // adopt the early reservation from android_main, if there is one:
         // it got the biggest hole before ART/EGL fragmented the space
         let early = EARLY_BASE.swap(0, Ordering::SeqCst);
@@ -95,10 +116,11 @@ impl View {
                 0,
             )
         };
-        if base == libc::MAP_FAILED {
-            log::warn!("fastmem: could not reserve {} MiB of address space: {}", SPAN >> 20, std::io::Error::last_os_error());
-            return None;
-        }
+    if base == libc::MAP_FAILED {
+        log::warn!("fastmem: could not reserve {} MiB of address space: {}", SPAN >> 20, std::io::Error::last_os_error());
+        log_maps_gap("View::new failed");
+        return None;
+    }
         let base = base as *mut u8;
         let Some(slot) = VIEWS.iter().position(|view| view.compare_exchange(0, base as usize, Ordering::AcqRel, Ordering::Acquire).is_ok()) else {
             // SAFETY: the reservation just made

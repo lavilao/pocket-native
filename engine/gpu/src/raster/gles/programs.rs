@@ -59,6 +59,14 @@ pub(super) const STAND_IN_COUNT: usize = 8;
 /// on the RX6H crashed in the compiler thread with both at it.
 pub(super) static COMPILER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// how many programs the driver has compiled and linked, for the log to
+/// say whether a slow run is still building them.
+pub(super) static SHADER_COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn shader_compiles() -> usize {
+    SHADER_COMPILES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// the sources the driver compiles or links and the thread at it, for a
 /// crash in its compiler to name them in the log and keep them out of the
 /// next runs: Mali's r13p0 crashes on the same source every time.
@@ -536,6 +544,7 @@ pub(super) type ProgramKey = ([u32; FRAGMENT_CONSTANTS], bool, Vec<u32>, u64);
 pub(super) static BUILD_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(super) fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, cached: Option<&std::path::Path>) -> Result<glow::Program, String> {
+    SHADER_COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let started = std::time::Instant::now();
     struct Timed(std::time::Instant);
     impl Drop for Timed {

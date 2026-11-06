@@ -148,13 +148,16 @@ impl Memory {
     pub fn fastmem(&self) -> *mut u8 {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let (Some(view), true) = (&self.view, self.phys.backing(FCRAM_PADDR, PAGE_SIZE).is_some()) {
-            return view.base();
+            let base = view.base();
+            log::info!("fastmem: view={base:p} shared=true Memory::new={}", fastmem::new_calls());
+            return base;
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         log::warn!(
-            "fastmem: no view for recompiled code (view: {}, shared backing: {})",
+            "fastmem: view={} shared={} Memory::new={} — reopened interpreter",
             self.view.is_some(),
-            self.phys.backing(FCRAM_PADDR, PAGE_SIZE).is_some()
+            self.phys.backing(FCRAM_PADDR, PAGE_SIZE).is_some(),
+            fastmem::new_calls()
         );
         std::ptr::null_mut()
     }
