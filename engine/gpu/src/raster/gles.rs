@@ -1310,6 +1310,7 @@ fn disturb() {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+
 struct AssertSend<T>(T);
 
 // SAFETY: only used for work the sending thread waits on, so nothing it
@@ -1502,6 +1503,8 @@ pub struct Gles {
     vertex_inputs: HashMap<u64, (u64, u32, [u32; SEMANTICS])>,
     /// what each program being made came from, for the manifest.
     inputs: HashMap<ProgramKey, String>,
+    /// fragment programs whose compilation crashed the driver in an earlier run.
+    bad_programs: rustc_hash::FxHashSet<ProgramKey>,
     shaded_array: glow::VertexArray,
     generic: bool,
     vertex_array: glow::VertexArray,
@@ -1631,6 +1634,7 @@ impl Gles {
                 vertex_sources: HashMap::new(),
                 vertex_inputs: HashMap::new(),
                 inputs: HashMap::new(),
+                bad_programs: load_bad_programs(),
                 shaded_array,
                 generic: crate::switch("ZAKURO_GENERIC_SHADERS", "generic shaders"),
                 vertex_array,
@@ -2875,6 +2879,9 @@ impl Gles {
         self.take_compiled(false);
         if let Some(&program) = self.programs.get(&key) {
             return Ok(Some(program));
+        }
+        if self.bad_programs.contains(&key) {
+            return Err("shader variant was blacklisted after a driver crash".to_owned());
         }
         if let Some(compiler) = &self.compiler {
             if let Some(error) = compiler.failed.get(&key) {
