@@ -205,8 +205,14 @@ pub enum StepOutcome {
 
 impl System {
     pub fn new(config: Config) -> System {
+        System::new_with_memory(config, 64 * 1024 * 1024)
+    }
+
+    /// creates a system with the title's actual application memory size.
+    /// The loader knows this before construction, so it can avoid allocating
+    /// and immediately dropping a temporary fastmem view.
+    pub(crate) fn new_with_memory(config: Config, app_bytes: u32) -> System {
         let boot_clock = config.clock.unwrap_or_else(memory::config::host_clock);
-        let app_bytes = 64 * 1024 * 1024;
         let mut services = ServiceState::default();
         if let Some(dir) = &config.data_dir {
             services.fs.user_dir = dir.join("user");
