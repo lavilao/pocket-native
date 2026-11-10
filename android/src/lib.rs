@@ -138,7 +138,21 @@ fn set_up(own: &Path, folder: &Path, data: &Path) {
     std::env::set_var("ZAKURO_FAST", "1");
     std::env::set_var("ZAKURO_DATA", data);
     if let Some(id) = folder.file_name() {
-        std::env::set_var("ZAKURO_RECOMPILED", own.join("code").join(id).with_extension("so"));
+        let code = own.join("code").join(id).with_extension("so");
+        std::env::set_var("ZAKURO_RECOMPILED", &code);
+        // The launcher normally installs title.so in private storage when a
+        // game is added. Recover it after a reinstall if the copied game
+        // folder still includes the original bundle.
+        let bundled = folder.join("title.so");
+        if !code.is_file() && bundled.is_file() {
+            let copied = code
+                .parent()
+                .and_then(|parent| std::fs::create_dir_all(parent).ok())
+                .and_then(|()| std::fs::copy(&bundled, &code).ok());
+            if copied.is_some() {
+                std::env::set_var("POCKET_NATIVE_NOTE", "restored title.so from the game folder");
+            }
+        }
     }
     // where the game ran code its build missed, in its folder on the card as
     // on ArkOS, which the kit's rebuild takes from games/<title id>: beside
