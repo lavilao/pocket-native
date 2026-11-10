@@ -44,8 +44,7 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         _ => (exheader.system_mode.application_memory(), exheader.system_mode as u32),
     };
 
-    let mut system = System::new(config);
-    system.memory = memory::Memory::new(system.config.new3ds, app_bytes).with_linear_base(linear_heap_base(system.config.new3ds));
+    let mut system = System::new_with_memory(config, app_bytes);
     system.kernel = crate::kernel::Kernel::new(
         title.program_id(),
         region,
