@@ -10,10 +10,15 @@ pub use fastmem::reserve_early;
 pub mod physical;
 
 use std::collections::BTreeMap;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use zakuro_common::memory_map::*;
 use zakuro_common::VAddr;
 use zakuro_cpu::Bus;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+static FASTMEM_STATUS_LOGGED: AtomicBool = AtomicBool::new(false);
 
 pub use physical::{MemoryRegion, PhysicalBlock, PhysicalMemory};
 
@@ -149,16 +154,20 @@ impl Memory {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let (Some(view), true) = (&self.view, self.phys.backing(FCRAM_PADDR, PAGE_SIZE).is_some()) {
             let base = view.base();
-            log::info!("fastmem: view={base:p} shared=true Memory::new={}", fastmem::new_calls());
+            if !FASTMEM_STATUS_LOGGED.swap(true, Ordering::Relaxed) {
+                log::info!("fastmem: view={base:p} shared=true Memory::new={}", fastmem::new_calls());
+            }
             return base;
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        log::warn!(
-            "fastmem: view={} shared={} Memory::new={} — reopened interpreter",
-            self.view.is_some(),
-            self.phys.backing(FCRAM_PADDR, PAGE_SIZE).is_some(),
-            fastmem::new_calls()
-        );
+        if !FASTMEM_STATUS_LOGGED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "fastmem: view={} shared={} Memory::new={} — reopened interpreter",
+                self.view.is_some(),
+                self.phys.backing(FCRAM_PADDR, PAGE_SIZE).is_some(),
+                fastmem::new_calls()
+            );
+        }
         std::ptr::null_mut()
     }
 
