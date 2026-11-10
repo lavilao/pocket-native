@@ -41,12 +41,22 @@ fn log_maps_gap(ctx: &str) {
     let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { return };
     let mut best = 0usize;
     let mut total = 0usize;
+    let mut previous_end = 0usize;
     for line in maps.lines() {
         let Some(range) = line.split_whitespace().next() else { continue };
         let Some((s, e)) = range.split_once('-') else { continue };
         let Ok(s) = usize::from_str_radix(s, 16) else { continue };
         let Ok(e) = usize::from_str_radix(e, 16) else { continue };
-        if e >= s { best = best.max(e - s); total += e - s; }
+        if e >= s {
+            best = best.max(s.saturating_sub(previous_end));
+            total += e - s;
+            previous_end = previous_end.max(e);
+        }
+    }
+    // Android's 32-bit userspace ends at 0xC0000000. Include the free tail
+    // after the last map when reporting whether the 1 GiB view could fit.
+    if usize::BITS == 32 {
+        best = best.max(0xC000_0000usize.saturating_sub(previous_end));
     }
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let vm = status.lines().filter(|l| l.starts_with("VmSize") || l.starts_with("VmPeak")).collect::<Vec<_>>().join(", ");

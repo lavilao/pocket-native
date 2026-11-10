@@ -128,7 +128,7 @@ layout(std430, set = 0, binding = 4) readonly buffer Tables {
     // the fog's 128, a value and a step. sized, not unsized: some GLSL
     // compilers (PowerVR UniFlex) crash compiling dynamic indexing into
     // an unsized uniform array, and the size is fixed by the formats above
-    vec2 tables[7808];
+    vec2 tables[7680];
 };
 
 const uint PROCTEX_MAPS = 24u * 256u;
