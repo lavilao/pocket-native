@@ -3574,6 +3574,8 @@ type Job = Box<dyn FnOnce() + Send>;
 
 type ProgramKey = ([u32; FRAGMENT_CONSTANTS], bool, Vec<u32>, u64);
 
+const RF4_POWER_VR_BAD_PROGRAM: &str = "([53478192, 268374015, 268374015, 249761507, 266538979, 267390960, 0, 0, 0, 1, 4096, 0, 65537, 0, 0, 65537, 524296, 65537, 0, 0, 0, 0, 0, 0, 0, 1048577, 0, 0, 6, 0], true, [], 14411559268116999476)";
+
 fn parse_program_key(text: &str) -> Option<ProgramKey> {
     let text = text.trim().strip_prefix('(')?.strip_suffix(')')?;
     let mut fields = Vec::with_capacity(4);
@@ -3677,7 +3679,7 @@ fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, cached: Optio
 
 /// reads the last interrupted shader compile before any programs are made,
 /// then returns the variants that must use the CPU rasterizer.
-fn load_bad_programs() -> rustc_hash::FxHashSet<ProgramKey> {
+fn load_bad_programs(renderer: &str) -> rustc_hash::FxHashSet<ProgramKey> {
     let Some(data) = std::env::var_os("ZAKURO_DATA").map(std::path::PathBuf::from) else {
         return rustc_hash::FxHashSet::default();
     };
@@ -3698,6 +3700,22 @@ fn load_bad_programs() -> rustc_hash::FxHashSet<ProgramKey> {
                 lines.dedup();
                 let _ = std::fs::write(&bad_path, lines.join("\n"));
                 log::warn!("shader: variant {previous} killed the driver last run; its draws will use the CPU");
+            }
+        }
+    }
+    let is_rune_factory_4 = data
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .is_some_and(|id| id == "0004000000766600");
+    let is_crashing_power_vr = renderer.contains("PowerVR Rogue GE8320") && renderer.contains("1.13@5776728");
+    if is_rune_factory_4 && is_crashing_power_vr {
+        if let Some(key) = parse_program_key(RF4_POWER_VR_BAD_PROGRAM) {
+            if bad.insert(key) {
+                lines.push(RF4_POWER_VR_BAD_PROGRAM.to_owned());
+                lines.sort_unstable();
+                lines.dedup();
+                let _ = std::fs::write(&bad_path, lines.join("\n"));
+                log::warn!("shader: avoiding the Rune Factory 4 variant that crashes PowerVR GE8320 1.13@5776728");
             }
         }
     }
@@ -4061,6 +4079,7 @@ impl Gles {
             LOCAL.with(|local| {
                 *local.borrow_mut() = Some(Local { cache: Cached::default(), disturbed: true, uniforms, shading, inputs, indices, vertices, resident: Resident::default(), tables, tables_at: None, table_sets: Default::default(), clears: Vec::new(), occlusion: Occlusion::default() });
             });
+            let bad_programs = load_bad_programs(&name);
             let mut gles = Gles {
                 gl,
                 worker,
@@ -4073,7 +4092,7 @@ impl Gles {
                 vertex_sources: HashMap::new(),
                 vertex_inputs: HashMap::new(),
                 inputs: HashMap::new(),
-                bad_programs: load_bad_programs(),
+                bad_programs,
                 shaded_array,
                 generic: crate::switch("ZAKURO_GENERIC_SHADERS", "generic shaders"),
                 vertex_array,
