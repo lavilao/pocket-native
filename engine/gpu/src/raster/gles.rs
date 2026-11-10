@@ -1311,6 +1311,7 @@ fn disturb() {
 type Job = Box<dyn FnOnce() + Send>;
 
 
+
 struct AssertSend<T>(T);
 
 // SAFETY: only used for work the sending thread waits on, so nothing it
@@ -1622,6 +1623,7 @@ impl Gles {
             LOCAL.with(|local| {
                 *local.borrow_mut() = Some(Local { cache: Cached::default(), disturbed: true, uniforms, shading, inputs, indices, vertices, resident: Resident::default(), tables, tables_at: None, table_sets: Default::default(), clears: Vec::new(), occlusion: Occlusion::default() });
             });
+            let bad_programs = load_bad_programs(&name);
             let mut gles = Gles {
                 gl,
                 worker,
@@ -1634,7 +1636,7 @@ impl Gles {
                 vertex_sources: HashMap::new(),
                 vertex_inputs: HashMap::new(),
                 inputs: HashMap::new(),
-                bad_programs: load_bad_programs(),
+                bad_programs,
                 shaded_array,
                 generic: crate::switch("ZAKURO_GENERIC_SHADERS", "generic shaders"),
                 vertex_array,
