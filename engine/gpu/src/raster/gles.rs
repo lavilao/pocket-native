@@ -3574,31 +3574,54 @@ type Job = Box<dyn FnOnce() + Send>;
 
 type ProgramKey = ([u32; FRAGMENT_CONSTANTS], bool, Vec<u32>, u64);
 
+fn parse_program_key(text: &str) -> Option<ProgramKey> {
+    let text = text.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let mut fields = Vec::with_capacity(4);
+    let mut start = 0;
+    let mut depth = 0usize;
+    for (index, character) in text.char_indices() {
+        match character {
+            '[' => depth += 1,
+            ']' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                fields.push(text[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    fields.push(text[start..].trim());
+    let [constants, writes_depth, lighting, vertex] = fields.as_slice() else {
+        return None;
+    };
+    let words = |field: &str| -> Option<Vec<u32>> {
+        let values = field.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+        if values.is_empty() {
+            return Some(Vec::new());
+        }
+        values.split(',').map(|value| value.trim().parse().ok()).collect()
+    };
+    Some((
+        words(constants)?.try_into().ok()?,
+        writes_depth.parse().ok()?,
+        words(lighting)?,
+        vertex.parse().ok()?,
+    ))
+}
+
 /// compiles and links a program, or loads it from the program binary cache
 /// when it was made before, its samplers on the texture units.
 fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, cached: Option<&std::path::Path>, key: &ProgramKey) -> Result<glow::Program, String> {
     // marker file: variant name before compile, removed on success.
-    // If the driver segfaults (UniFlex 0x3f80025c), the marker survives;
-    // next run sees it and skips that variant (uses DYNAMIC stand-in).
-    let _marker = std::env::var_os("ZAKURO_DATA").map(std::path::PathBuf::from).map(|d| d.join("shader_marker.txt"));
+    // If the driver segfaults, the marker survives and the next run blacklists it.
+    let _compiling = COMPILER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let marker_data = std::env::var_os("ZAKURO_DATA").map(std::path::PathBuf::from);
     if let Some(d) = &marker_data {
         let m = d.join("shader_marker.txt");
-        if m.exists() {
-            if let Ok(prev) = std::fs::read_to_string(&m) {
-                let bad: std::collections::HashSet<String> = std::fs::read_to_string(d.join("shader_bad.txt")).unwrap_or_default().lines().map(str::to_string).collect();
-                if !bad.contains(prev.trim()) {
-                    let mut bad = bad; bad.insert(prev.trim().to_string());
-                    let _ = std::fs::write(d.join("shader_bad.txt"), bad.into_iter().collect::<Vec<_>>().join("\n"));
-                    log::warn!("shader: variant {} killed the driver last run, marking bad", prev.trim());
-                }
-            }
-        }
         let _ = std::fs::write(&m, format!("{:?}", key));
     }
     SHADER_COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let started = std::time::Instant::now();
-    let _compiling = COMPILER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     // SAFETY: the context is current on this thread, the shaders are deleted
     // once linked into the program
     unsafe {
@@ -3650,6 +3673,38 @@ fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, cached: Optio
         if let Some(d) = &marker_data { let _ = std::fs::remove_file(d.join("shader_marker.txt")); }
         Ok(program)
     }
+}
+
+/// reads the last interrupted shader compile before any programs are made,
+/// then returns the variants that must use the CPU rasterizer.
+fn load_bad_programs() -> rustc_hash::FxHashSet<ProgramKey> {
+    let Some(data) = std::env::var_os("ZAKURO_DATA").map(std::path::PathBuf::from) else {
+        return rustc_hash::FxHashSet::default();
+    };
+    let bad_path = data.join("shader_bad.txt");
+    let mut lines: Vec<String> = std::fs::read_to_string(&bad_path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let mut bad: rustc_hash::FxHashSet<ProgramKey> = lines.iter().filter_map(|line| parse_program_key(line)).collect();
+    let marker = data.join("shader_marker.txt");
+    if let Ok(previous) = std::fs::read_to_string(&marker) {
+        let previous = previous.trim();
+        if let Some(key) = parse_program_key(previous) {
+            if bad.insert(key) {
+                lines.push(previous.to_owned());
+                lines.sort_unstable();
+                lines.dedup();
+                let _ = std::fs::write(&bad_path, lines.join("\n"));
+                log::warn!("shader: variant {previous} killed the driver last run; its draws will use the CPU");
+            }
+        }
+    }
+    if !bad.is_empty() {
+        log::warn!("shader: avoiding {} variants that crashed or failed to compile before", bad.len());
+    }
+    bad
 }
 
 /// a program for the compiler thread to make.
@@ -3896,6 +3951,8 @@ pub struct Gles {
     vertex_inputs: HashMap<u64, (u64, u32, [u32; SEMANTICS])>,
     /// what each program being made came from, for the manifest.
     inputs: HashMap<ProgramKey, String>,
+    /// fragment programs whose compilation crashed the driver in an earlier run.
+    bad_programs: rustc_hash::FxHashSet<ProgramKey>,
     shaded_array: glow::VertexArray,
     generic: bool,
     vertex_array: glow::VertexArray,
@@ -4016,6 +4073,7 @@ impl Gles {
                 vertex_sources: HashMap::new(),
                 vertex_inputs: HashMap::new(),
                 inputs: HashMap::new(),
+                bad_programs: load_bad_programs(),
                 shaded_array,
                 generic: crate::switch("ZAKURO_GENERIC_SHADERS", "generic shaders"),
                 vertex_array,
@@ -5233,6 +5291,9 @@ impl Gles {
         self.take_compiled(false);
         if let Some(&program) = self.programs.get(&key) {
             return Ok(Some(program));
+        }
+        if self.bad_programs.contains(&key) {
+            return Err("shader variant was blacklisted after a driver crash".to_owned());
         }
         if let Some(compiler) = &self.compiler {
             if let Some(error) = compiler.failed.get(&key) {
