@@ -29,6 +29,49 @@ mod settings;
 mod sound;
 mod touch;
 
+// Android can send log records to both the app's log file and logcat. The
+// android_logger crate cannot be installed after env_logger owns the global
+// `log` logger, so forward records here instead of trying to install a second
+// global logger.
+#[cfg(target_os = "android")]
+struct AndroidLogger(env_logger::Logger);
+
+#[cfg(target_os = "android")]
+impl log::Log for AndroidLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        use std::ffi::CString;
+
+        self.0.log(record);
+        let text = record.args().to_string().replace('\0', "�");
+        let Ok(text) = CString::new(text) else { return };
+        let priority = match record.level() {
+            log::Level::Error => 6,
+            log::Level::Warn => 5,
+            log::Level::Info => 4,
+            log::Level::Debug => 3,
+            log::Level::Trace => 2,
+        };
+        // SAFETY: both strings are NUL-terminated and live through the call.
+        unsafe {
+            __android_log_write(priority, b"pocketnative\0".as_ptr().cast(), text.as_ptr());
+        }
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
+#[cfg(target_os = "android")]
+#[link(name = "log")]
+unsafe extern "C" {
+    fn __android_log_write(priority: libc::c_int, tag: *const libc::c_char, text: *const libc::c_char) -> libc::c_int;
+}
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
@@ -110,13 +153,16 @@ pub fn run(mut args: Vec<String>) {
         if let Some(file) = file {
             logger.target(env_logger::Target::Pipe(Box::new(file)));
         }
-        // on Android, mirror to logcat under the "pocketnative" tag so
-        // `adb logcat -s pocketnative` shows it (only reads the file
-        // otherwise). init_once is a no-op if a logger is already set,
-        // so it must come after env_logger's init: it can't double-set.
-        logger.try_init().expect("Pocket Native's logger should not be set twice");
         #[cfg(target_os = "android")]
-        android_logger::init_once(android_logger::Config::default().with_tag("pocketnative"));
+        {
+            let logger = logger.build();
+            let max_level = logger.filter();
+            log::set_boxed_logger(Box::new(AndroidLogger(logger)))
+                .expect("Pocket Native's logger should not be set twice");
+            log::set_max_level(max_level);
+        }
+        #[cfg(not(target_os = "android"))]
+        logger.try_init().expect("Pocket Native's logger should not be set twice");
         log::info!("Pocket Native {} (git {})", env!("CARGO_PKG_VERSION"), git_hash());
         crash::watch(crash_log);
         // a note from a program around the frontend, which has no log of its own
