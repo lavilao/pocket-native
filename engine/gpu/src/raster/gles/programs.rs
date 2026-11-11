@@ -103,6 +103,36 @@ pub(super) fn crashed() -> rustc_hash::FxHashSet<u64> {
     text.lines().filter_map(|line| u64::from_str_radix(line.trim(), 16).ok()).collect()
 }
 
+/// the fragment constants of the program the Redmi 9's PowerVR GE8320,
+/// driver 1.13@5776728, crashed in its compiler on: Rune Factory 4's. The
+/// driver dies in PVRUniFlexCompileToHw, taking the process with it, so the
+/// fingerprint crashed() would learn is only there for a later run, if at
+/// all. Its draws go to the CPU rasterizer from the first one.
+pub(super) const RF4_POWER_VR_CONSTANTS: [u32; FRAGMENT_CONSTANTS] = [
+    53478192, 268374015, 268374015, 249761507, 266538979, 267390960, 0, 0, 0, 1, 4096, 0, 65537, 0, 0, 65537, 524296, 65537, 0, 0, 0, 0, 0, 0, 0, 1048577, 0, 0, 6, 0,
+];
+
+/// whether this program is the one known to crash that driver, which the
+/// game's own folder tells apart from any other game's.
+pub(super) fn known_bad(constants: &[u32; FRAGMENT_CONSTANTS], writes_depth: bool, lighting: &[u32]) -> bool {
+    writes_depth && lighting.is_empty() && constants == &RF4_POWER_VR_CONSTANTS
+}
+
+/// whether this run is Rune Factory 4 on the PowerVR whose compiler died on
+/// it: "PowerVR Rogue GE8320 (OpenGL ES 3.2 build 1.13@5776728)" is what the
+/// Redmi 9 answers.
+pub(super) fn should_leave_out(renderer: &str) -> bool {
+    let id = std::env::var_os("ZAKURO_DATA").map(std::path::PathBuf::from).and_then(|data| data.parent()?.file_name().map(|id| id.to_owned()));
+    if id.is_none_or(|id| id != "0004000000766600") {
+        return false;
+    }
+    if !(renderer.contains("PowerVR Rogue GE8320") && renderer.contains("1.13@5776728")) {
+        return false;
+    }
+    log::warn!("shaders: Rune Factory 4's program that crashes this PowerVR's compiler is left out, its draws go to the CPU");
+    true
+}
+
 /// marks what the driver is about to compile, nothing once it is done.
 pub(super) fn at_compiler(sources: [&str; 2]) {
     use std::sync::atomic::Ordering::Relaxed;

@@ -1310,8 +1310,6 @@ fn disturb() {
 
 type Job = Box<dyn FnOnce() + Send>;
 
-
-
 struct AssertSend<T>(T);
 
 // SAFETY: only used for work the sending thread waits on, so nothing it
@@ -1504,8 +1502,6 @@ pub struct Gles {
     vertex_inputs: HashMap<u64, (u64, u32, [u32; SEMANTICS])>,
     /// what each program being made came from, for the manifest.
     inputs: HashMap<ProgramKey, String>,
-    /// fragment programs whose compilation crashed the driver in an earlier run.
-    bad_programs: rustc_hash::FxHashSet<ProgramKey>,
     shaded_array: glow::VertexArray,
     generic: bool,
     vertex_array: glow::VertexArray,
@@ -1550,6 +1546,9 @@ pub struct Gles {
     retried: rustc_hash::FxHashSet<ProgramKey>,
     /// fingerprints of the sources the driver crashed on before.
     crashed: rustc_hash::FxHashSet<u64>,
+    /// this run is Rune Factory 4 on the PowerVR whose compiler dies on one
+    /// of its programs, which goes to the CPU from the start.
+    leave_out_rf4: bool,
     /// display transfers so far, the clock occlusion culling keeps time by.
     pictures: u64,
     warned_logic_op: bool,
@@ -1623,7 +1622,7 @@ impl Gles {
             LOCAL.with(|local| {
                 *local.borrow_mut() = Some(Local { cache: Cached::default(), disturbed: true, uniforms, shading, inputs, indices, vertices, resident: Resident::default(), tables, tables_at: None, table_sets: Default::default(), clears: Vec::new(), occlusion: Occlusion::default() });
             });
-            let bad_programs = load_bad_programs(&name);
+            let leave_out_rf4 = should_leave_out(&name);
             let mut gles = Gles {
                 gl,
                 worker,
@@ -1636,7 +1635,6 @@ impl Gles {
                 vertex_sources: HashMap::new(),
                 vertex_inputs: HashMap::new(),
                 inputs: HashMap::new(),
-                bad_programs,
                 shaded_array,
                 generic: crate::switch("ZAKURO_GENERIC_SHADERS", "generic shaders"),
                 vertex_array,
@@ -1672,6 +1670,7 @@ impl Gles {
                 room_made: None,
                 retried: Default::default(),
                 crashed: crashed(),
+                leave_out_rf4,
                 pictures: 0,
                 warned_logic_op: false,
                 preloading: false,
@@ -2882,9 +2881,6 @@ impl Gles {
         if let Some(&program) = self.programs.get(&key) {
             return Ok(Some(program));
         }
-        if self.bad_programs.contains(&key) {
-            return Err("shader variant was blacklisted after a driver crash".to_owned());
-        }
         if let Some(compiler) = &self.compiler {
             if let Some(error) = compiler.failed.get(&key) {
                 return Err(error.clone());
@@ -2898,6 +2894,9 @@ impl Gles {
                 }
                 return self.programs.get(&key).map(|&program| Some(program)).ok_or_else(|| "the compiler thread stopped".to_owned());
             }
+        }
+        if self.leave_out_rf4 && known_bad(constants, writes_depth, lighting) {
+            return Err("this program crashes the driver's compiler, the CPU draws it".to_owned());
         }
         let mut debug_constants = *constants;
         let debug = std::env::var("ZAKURO_FS_DEBUG").unwrap_or_default();
