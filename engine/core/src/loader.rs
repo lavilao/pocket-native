@@ -127,8 +127,38 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         }
     }
 
+    system.dlc = load_dlc(&title, &system.config.dlc);
     system.title = Some(title);
     Ok(system)
+}
+
+/// the DLC among the CIAs given beside the game, the ones whose id is the
+/// game's own, by the low half: an update or another game's DLC is left out
+/// with a line saying so.
+fn load_dlc(title: &Title, paths: &[std::path::PathBuf]) -> Vec<zakuro_fs::Dlc> {
+    let program_id = title.program_id();
+    let mut found = Vec::new();
+    for path in paths {
+        match zakuro_fs::Dlc::load(path) {
+            Ok(dlc) if dlc.title_id & 0xFFFF_FFFF == program_id & 0xFFFF_FFFF => {
+                let held = dlc.contents.iter().filter(|content| content.offset.is_some()).count();
+                log::info!(
+                    "DLC v{} from {}, {held} of its {} contents",
+                    zakuro_fs::version_name(dlc.version),
+                    path.display(),
+                    dlc.contents.len()
+                );
+                found.push(dlc);
+            }
+            Ok(dlc) => log::warn!(
+                "{} is DLC of {:016X}, not this game, it is left out",
+                path.display(),
+                dlc.title_id
+            ),
+            Err(error) => log::warn!("could not load {} as DLC, {error}", path.display()),
+        }
+    }
+    found
 }
 
 /// where the executable's code is.

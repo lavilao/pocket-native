@@ -26,6 +26,8 @@ pub const ARCHIVE_NCCH: u32 = 0x2345_678A;
 
 /// media the NCCH archive's path can select.
 const MEDIA_NAND: u8 = 0;
+/// the SD card, where DLC contents live.
+const MEDIA_SDMC: u8 = 1;
 const MEDIA_GAMECARD: u8 = 2;
 
 /// high title IDs of the two NAND archives a game reads shared data from.
@@ -101,8 +103,8 @@ const DIRECTORY_ENTRY_SIZE: u32 = 0x228;
 /// an open file, and where its bytes come from.
 #[derive(Debug, Clone)]
 pub enum FileBacking {
-    /// a window into the loaded ROM image.
-    RomImage { offset: u64, size: u64 },
+    /// a window into a ROM image, the title's own or one of its DLC's.
+    RomImage { image: std::sync::Arc<zakuro_fs::RomImage>, offset: u64, size: u64 },
     /// a file in one of the writable archives, kept on the host.
     Host(PathBuf),
     /// read-only bytes generated in memory.
@@ -987,6 +989,12 @@ fn open_file(
                     let kind = system.memory.read32(path_ptr + 8);
                     open_ncch_kind(system, kind)
                 }
+                MEDIA_SDMC => {
+                    let content_index = system.memory.read32(path_ptr + 4) as u16;
+                    let kind = system.memory.read32(path_ptr + 8);
+                    let title_id = (archive_path.high_program_id as u64) << 32 | archive_path.low_program_id as u64;
+                    open_sd_title(system, title_id, content_index, kind)
+                }
                 other => {
                     log::warn!(
                         "fs: NCCH archive media type {other} is not implemented ({:08X}{:08X})",
@@ -1058,6 +1066,7 @@ fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
             let romfs = title.romfs.as_ref()?;
             let size = title.ncch.romfs_size.saturating_sub(0x1000);
             let backing = FileBacking::RomImage {
+                image: title.shared_image(),
                 offset: romfs.base,
                 size,
             };
@@ -1083,6 +1092,31 @@ fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
             None
         }
     }
+}
+
+/// opens a title on the SD card through the NCCH archive: the game itself,
+/// which this build runs from its own file, or the content of an index of
+/// its DLC.
+fn open_sd_title(system: &mut System, title_id: u64, content_index: u16, kind: u32) -> Option<u32> {
+    let title = system.title.as_ref()?;
+    if title_id == title.program_id() {
+        return open_ncch_kind(system, kind);
+    }
+    if kind != SELF_NCCH_ROMFS {
+        log::warn!("fs: {title_id:016X} opened as path type {kind}, which DLC does not have");
+        return None;
+    }
+    let dlc = system.dlc.iter().find(|dlc| dlc.title_id == title_id)?;
+    let Some((offset, size)) = dlc.romfs(content_index) else {
+        log::warn!("fs: DLC {title_id:016X} has no content {content_index}");
+        return None;
+    };
+    let image = dlc.image();
+    log::debug!("fs: opened DLC {title_id:016X} content {content_index}, {} KiB", size / 1024);
+    Some(system.services.fs.add_file(OpenFile {
+        path: format!("dlc:/{content_index}"),
+        backing: FileBacking::RomImage { image, offset, size },
+    }))
 }
 
 /// how long a read of length bytes takes on the console, in nanoseconds,
@@ -1122,6 +1156,7 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
 
     match file.backing {
         FileBacking::RomImage {
+            image,
             offset: base,
             size: total,
         } => {
@@ -1129,13 +1164,10 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
                 return 0;
             }
             let count = (size as u64).min(total - offset) as usize;
-            let Some(title) = system.title.as_ref() else {
-                return 0;
-            };
             let start = base + offset;
-            // copying through a temporary keeps the borrow of title from
-            // overlapping the mutable borrow of memory.
-            {
+            // the blocks a frontend reads ahead are the game's own, whose
+            // offsets it knows; a DLC's image is another file
+            if system.title.as_ref().is_some_and(|title| title.is_image(&image)) {
                 let mut blocks = ROM_BLOCKS.lock().unwrap();
                 let (seen, order) = &mut *blocks;
                 let seen = seen.get_or_insert_with(HashSet::new);
@@ -1147,7 +1179,7 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
                 }
             }
             let started = std::time::Instant::now();
-            let Ok(data) = title.image().read_at(start, count) else {
+            let Ok(data) = image.read_at(start, count) else {
                 log::warn!("fs: read past the end of the ROM image");
                 return 0;
             };

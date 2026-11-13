@@ -56,6 +56,9 @@ pub struct Config {
     /// how many times the console's resolution the host's GPU draws at, in
     /// quarters from 1 to 4.
     pub resolution: f32,
+    /// downloadable content beside the game, DLC CIAs. the loader keeps the
+    /// ones whose id is this game's and drops the rest.
+    pub dlc: Vec<std::path::PathBuf>,
     /// the time the console's clock starts at, in milliseconds since 1900,
     /// the host's when none, a fixed one makes runs repeat exactly.
     pub clock: Option<u64>,
@@ -76,6 +79,7 @@ impl Default for Config {
             hardware_renderer: false,
             software_draws: false,
             resolution: 1.0,
+            dlc: Vec::new(),
             clock: None,
         }
     }
@@ -117,6 +121,9 @@ pub struct System {
     pub gpu: Gpu,
     pub renderer: Box<dyn Renderer>,
     pub title: Option<Title>,
+    /// the title's downloadable content, the DLC CIAs beside its file whose
+    /// id is its own.
+    pub dlc: Vec<zakuro_fs::Dlc>,
     pub config: Config,
 
     pub exited: bool,
@@ -225,6 +232,7 @@ impl System {
             gpu: Gpu::new(),
             renderer: Box::new(SoftwareRenderer::default()),
             title: None,
+            dlc: Vec::new(),
             config,
             exited: false,
             broke: false,

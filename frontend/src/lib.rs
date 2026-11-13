@@ -121,6 +121,21 @@ fn title_id_of(path: &str) -> u64 {
     u64::from_le_bytes(header[0x108..0x110].try_into().unwrap())
 }
 
+/// the CIA files in the game's folder, the DLC a game reads beside its ROM.
+/// which of them is its own is for the loader to decide, by title id.
+fn cias_beside(path: &str) -> Vec<PathBuf> {
+    let folder = std::path::Path::new(path).parent().filter(|parent| !parent.as_os_str().is_empty());
+    let Some(folder) = folder else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(folder) else { return Vec::new() };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cia")))
+        .collect();
+    found.sort();
+    found
+}
+
 /// POCKET_NATIVE_POWER names a program the launcher gives for the system's
 /// CPU and GPU speeds, run with saver, balanced or performance.
 fn apply_power(power: Power) {
@@ -205,6 +220,7 @@ pub fn run(mut args: Vec<String>) {
         // ZAKURO_CLOCK=milliseconds since 1900 starts the clock there, as boot
         // takes it, so that a scripted run meets the same encounters
         clock: std::env::var("ZAKURO_CLOCK").ok().and_then(|v| v.parse().ok()),
+        dlc: cias_beside(&path),
         ..Config::default()
     };
     let mut system = match loader::load(&path, config) {

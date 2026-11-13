@@ -12,8 +12,9 @@ pub mod romfs;
 pub mod romfs_build;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-pub use cia::Cia;
+pub use cia::{version_name, Cia, Content, TitleKind};
 pub use exefs::ExeFs;
 pub use ncch::{n3ds_application_memory, CodeSetInfo, ExHeader, MemoryType, NcchHeader, SystemMode};
 pub use ncsd::Ncsd;
@@ -81,6 +82,7 @@ pub enum FsError {
 /// file data come in through pread instead and the kernel's page cache
 /// does the keeping. offsets stay u64 all the way, so nothing truncates
 /// on a 32-bit host.
+#[derive(Debug)]
 pub struct RomImage {
     path: PathBuf,
     file: std::fs::File,
@@ -189,7 +191,9 @@ impl ReadExactAt for std::fs::File {
 /// a loaded title, the executable NCCH of a cartridge, with its headers parsed
 /// and its filesystems located.
 pub struct Title {
-    image: RomImage,
+    /// shared, since a file opened through the fs service reads through it
+    /// from another thread while the title is in use.
+    image: Arc<RomImage>,
     /// offset of the CXI inside the image.
     ncch_offset: u64,
     pub ncch: NcchHeader,
@@ -201,7 +205,7 @@ pub struct Title {
 
 impl Title {
     pub fn load(path: impl AsRef<Path>) -> Result<Title, FsError> {
-        let image = RomImage::open(path)?;
+        let image = Arc::new(RomImage::open(path)?);
         // the format headers live at the start of the file: the first
         // 0x2020 bytes hold a CIA header and every magic (NCSD/NCCH at
         // 0x100), so a bounded head read decides the format.
@@ -217,8 +221,9 @@ impl Title {
             ncsd.executable_partition()?.offset
         } else if Cia::detect(&head) {
             let cia = Cia::parse_from(&image)?;
+            let (offset, _size) = cia.executable().ok_or(FsError::NoExecutablePartition)?;
             log::info!("CIA archive, title {:016X}", cia.title_id);
-            cia.executable.0
+            offset
         } else if NcchHeader::detect(&head) {
             0
         } else {
@@ -260,6 +265,18 @@ impl Title {
 
     pub fn image(&self) -> &RomImage {
         &self.image
+    }
+
+    /// the image itself, for a file the fs service reads through while the
+    /// system holds the title.
+    pub fn shared_image(&self) -> Arc<RomImage> {
+        self.image.clone()
+    }
+
+    /// whether image is this title's own, whose blocks the frontend reads
+    /// ahead; DLC contents are other images, read at their own offsets.
+    pub fn is_image(&self, image: &Arc<RomImage>) -> bool {
+        Arc::ptr_eq(&self.image, image)
     }
 
     pub fn ncch_offset(&self) -> u64 {
@@ -307,6 +324,60 @@ impl Title {
             "{} [{}] title={:016X} v{}",
             self.exheader.title, self.ncch.product_code, self.ncch.program_id, self.ncch.version
         )
+    }
+}
+
+/// downloadable content, from its CIA: contents of data a game opens by
+/// their index, each an NCCH with a RomFS, read from the image on demand.
+pub struct Dlc {
+    image: Arc<RomImage>,
+    pub title_id: u64,
+    pub version: u16,
+    /// every content its TMD lists, those the file holds with a place.
+    pub contents: Vec<Content>,
+}
+
+impl Dlc {
+    pub fn load(path: impl AsRef<Path>) -> Result<Dlc, FsError> {
+        let image = Arc::new(RomImage::open(path)?);
+        let head = image.read_at(0, (image.len().min(0x2020)) as usize)?;
+        if !Cia::detect(&head) {
+            return Err(FsError::BadCia("DLC comes as a CIA"));
+        }
+        let cia = Cia::read_from(&image)?;
+        if cia.kind() != TitleKind::Dlc {
+            return Err(FsError::BadCia("it is not DLC"));
+        }
+        // a content the file holds but cannot be read is worse than none: the
+        // game would open it and read noise, so the whole archive is refused
+        if cia.contents.iter().any(|content| content.offset.is_some() && content.encrypted()) {
+            return Err(FsError::EncryptedCia);
+        }
+        Ok(Dlc { image, title_id: cia.title_id, version: cia.version, contents: cia.contents })
+    }
+
+    pub fn image(&self) -> Arc<RomImage> {
+        self.image.clone()
+    }
+
+    /// the content of an index, none when the TMD does not list it.
+    pub fn content(&self, index: u16) -> Option<Content> {
+        self.contents.iter().find(|content| content.index == index).copied()
+    }
+
+    /// where the RomFS of the content of an index lies in the image, the
+    /// window a game reads it through, none when the file leaves the content
+    /// out or the NCCH behind it is encrypted or has no RomFS.
+    pub fn romfs(&self, index: u16) -> Option<(u64, u64)> {
+        let offset = self.contents.iter().find(|content| content.index == index)?.offset?;
+        let head = self.image.read_at(offset, NcchHeader::SIZE).ok()?;
+        let ncch = NcchHeader::parse(&head).ok()?;
+        if !ncch.has_romfs() || (!ncch.is_decrypted() && ncch.crypto_method() != 0) {
+            return None;
+        }
+        let romfs = RomFs::parse_from(&self.image, offset + ncch.romfs_offset).ok()?;
+        let end = offset + ncch.romfs_offset + ncch.romfs_size;
+        Some((romfs.base, end.saturating_sub(romfs.base)))
     }
 }
 
@@ -366,5 +437,82 @@ mod tests {
         assert_eq!(image.read_at(0xFFFF_FFF0, 3).unwrap(), b"low");
         assert_eq!(image.read_at(0x1_0000_0000, 4).unwrap(), b"high");
         assert_eq!(&image.read_at(0xFFFF_FFF8, 16).unwrap()[8..12], b"high");
+    }
+
+    /// a DLC's CIA of one delivered content, an NCCH whose RomFS holds one
+    /// file: the archive, where the content starts and the level-3 image.
+    fn dlc_cia(title_id: u64, flags: u16) -> (Vec<u8>, u64, Vec<u8>) {
+        use crate::romfs_build::{build, BuildFile};
+        // the TMD's own header, past the signature and its padding
+        const TMD_HEADER: usize = 0x140;
+        // its content records follow 64 content info records
+        const RECORDS: usize = 0xC4 + 64 * 0x24;
+        let level3 = build(&[BuildFile { path: "addon.bin".into(), data: vec![1, 2, 3, 4] }]);
+        // the NCCH: its header, an IVFC header a page long, the level-3 image
+        let romfs_offset = 0x200;
+        let romfs_size = (0x1000 + level3.len()).next_multiple_of(0x200);
+        let mut content = vec![0u8; romfs_offset + romfs_size];
+        content[0x100..0x104].copy_from_slice(b"NCCH");
+        content[0x1B0..0x1B4].copy_from_slice(&((romfs_offset / 0x200) as u32).to_le_bytes());
+        content[0x1B4..0x1B8].copy_from_slice(&((romfs_size / 0x200) as u32).to_le_bytes());
+        // flags[7]: decrypted, and with a RomFS
+        content[0x18F] = 4;
+        content[romfs_offset..romfs_offset + 4].copy_from_slice(b"IVFC");
+        content[romfs_offset + 4..romfs_offset + 8].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        // level 3's blocks are a page, which is where its image then starts
+        content[romfs_offset + 0x0C + 2 * 0x18 + 0x10..][..4].copy_from_slice(&12u32.to_le_bytes());
+        content[romfs_offset + 0x1000..romfs_offset + 0x1000 + level3.len()].copy_from_slice(&level3);
+
+        let (certificates, ticket) = (0xA00u32, 0x350u32);
+        let tmd_size = TMD_HEADER + RECORDS + 0x30;
+        let tmd_offset = (0x2020u64 + certificates as u64).next_multiple_of(0x40) + ticket as u64;
+        let tmd_offset = tmd_offset.next_multiple_of(0x40);
+        let mut data = vec![0u8; 0x2020];
+        data[..4].copy_from_slice(&0x2020u32.to_le_bytes());
+        data[0x08..0x0C].copy_from_slice(&certificates.to_le_bytes());
+        data[0x0C..0x10].copy_from_slice(&ticket.to_le_bytes());
+        data[0x10..0x14].copy_from_slice(&(tmd_size as u32).to_le_bytes());
+        // content 0 is the one the file holds
+        data[0x20] = 0x80;
+        data.resize(tmd_offset as usize + tmd_size, 0);
+        let tmd = &mut data[tmd_offset as usize..];
+        tmd[..4].copy_from_slice(&0x0001_0004u32.to_be_bytes());
+        let header = &mut tmd[TMD_HEADER..];
+        header[0x4C..0x54].copy_from_slice(&title_id.to_be_bytes());
+        header[0x9C..0x9E].copy_from_slice(&0x0400u16.to_be_bytes());
+        header[0x9E..0xA0].copy_from_slice(&1u16.to_be_bytes());
+        let record = &mut header[RECORDS..];
+        record[0x00..0x04].copy_from_slice(&1u32.to_be_bytes());
+        record[0x06..0x08].copy_from_slice(&flags.to_be_bytes());
+        record[0x08..0x10].copy_from_slice(&(content.len() as u64).to_be_bytes());
+
+        let content_offset = (tmd_offset + tmd_size as u64).next_multiple_of(0x40);
+        data.resize(content_offset as usize + content.len(), 0);
+        data[content_offset as usize..].copy_from_slice(&content);
+        (data, content_offset, level3)
+    }
+
+    #[test]
+    fn a_dlc_content_reads_through_its_romfs() {
+        let (data, content_offset, level3) = dlc_cia(0x0004_008C_0016_4800, 0);
+        let path = scratch("addon.cia");
+        std::fs::write(&path, &data).unwrap();
+        let dlc = Dlc::load(&path).unwrap();
+        assert_eq!(dlc.title_id, 0x0004_008C_0016_4800);
+        assert_eq!(version_name(dlc.version), "1.0.0");
+
+        // everything past the IVFC header, which is what a game reads
+        let (offset, size) = dlc.romfs(0).expect("content 0 has a RomFS");
+        assert_eq!(offset, content_offset + 0x200 + 0x1000);
+        assert_eq!(size, (0x1000 + level3.len() as u64).next_multiple_of(0x200) - 0x1000);
+        assert_eq!(dlc.image().read_at(offset, level3.len()).unwrap(), level3);
+        // and an index its TMD does not list is simply not there
+        assert_eq!(dlc.romfs(1), None);
+
+        // a game is not DLC, and a content too encrypted to read is refused
+        std::fs::write(&path, dlc_cia(0x0004_0000_0016_4800, 0).0).unwrap();
+        assert!(matches!(Dlc::load(&path), Err(FsError::BadCia(_))));
+        std::fs::write(&path, dlc_cia(0x0004_008C_0016_4800, 1).0).unwrap();
+        assert!(matches!(Dlc::load(&path), Err(FsError::EncryptedCia)));
     }
 }
