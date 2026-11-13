@@ -24,23 +24,28 @@ Integrar las mejoras recientes de Pocket Native y Zakuro sin perder el soporte A
 ### 1. Completar la evaluación del rebase en el worktree aislado
 
 1. Resolver los tres conflictos actuales manteniendo las refactorizaciones upstream donde sean aplicables y portando las correcciones de shaders y GLES del fork.
+   - En `raster.frag`, conservar el flag `in_place` como `(units[unit].z & 1u) != 0u`: la mitad alta de esa palabra contiene el LOD bias y no debe invertir la coordenada V. Mantener el bias en los seis muestreos incondicionales y aplicar la proyección de la unidad 0 antes de muestrear.
+   - En `gles/sources.rs`, adaptar la sustitución HALF a la nueva firma de `sample_unit` con argumentos prefetched y conservar alta precisión en parámetros y retorno de `sample_st`, así como en `st0/st1/st2`. Verificar el GLSL generado en modo normal y HALF; compilar Rust no valida estas sustituciones.
 2. Continuar el rebase commit por commit, preservando explícitamente la reserva de fastmem para ARM32, las rutas de lectura de ROM que evitan mapear archivos de más de 4 GiB de espacio virtual y la configuración/build Android de 32 bits.
 3. Revisar cada cambio de memoria, recompiler y compilación ARM32 contra `master`. No reemplazar ni reescribir `master` durante esta evaluación.
-4. Cuando el rebase termine, compilar para ARM32 y verificar primero el arranque y la recompilación de Fantasy Life en el teléfono. Comparar FPS y confirmar que no volvió al intérprete.
-5. Integrar a `master` solo después de revisar el diff completo y confirmar que conserva las capacidades ARM32 y las correcciones específicas del Redmi.
+4. Cuando el rebase termine, construir ambos artefactos ARM32 desde el mismo árbol: APK con `scripts/android/build.sh --32bit --test` y juego con `scripts/build.sh <ROM> --32bit`. Verificar la ABI del APK y de `title.so`.
+5. Probar juntos el APK y el juego en una instalación y datos de prueba aislados, sin reemplazar la instalación estable. Verificar primero Fantasy Life sin DLC: arranque, ejecución real de `title.so`, reserva fastmem y ausencia de fallback al intérprete. Comparar FPS bajo las mismas condiciones y registrar revisión, renderer, modo de precisión y errores.
+6. Integrar a `master` solo después de revisar el diff completo y registrar que conserva las capacidades ARM32 y las correcciones específicas del Redmi. La compilación por sí sola no satisface este criterio.
 
 ### 2. Portar soporte runtime para DLC CIA
 
 Basarse en la implementación de Zakuro, adaptándola a las estructuras actuales del fork:
 
-1. Leer el encabezado CIA y el TMD; obtener ID, versión, flags, índices y offsets de contenido sin copiar todo el archivo a memoria.
-2. Aceptar DLC solo si corresponde al juego por los 32 bits bajos del ID y si los contenidos que se van a leer están descifrados y contienen NCCH/RomFS válidos.
-3. Pasar los CIA encontrados junto al juego al cargador del sistema y conservar sus imágenes durante la ejecución.
-4. Implementar las consultas de `am:app` para lista, índices, versión e información de ticket que los juegos esperan.
-5. Abrir cada contenido por su ID e índice desde el servicio de archivos NCCH/SDMC; devolver errores claros para archivos cifrados, incompletos o de otro juego.
-6. Asociar automáticamente `dlc.cia` con el juego en el paquete de Fantasy Life y comprobar en el juego que sus contenidos estén visibles.
+1. Leer el encabezado CIA y el TMD; obtener ID, versión, flags, índices y offsets de contenido sin copiar ni mapear todo el archivo. Adaptar el uso de `image.data()` de Zakuro al acceso por rangos del fork para no competir con la reserva fastmem ARM32.
+2. Aceptar DLC solo si su categoría es DLC y corresponde al juego por los 32 bits bajos del ID. Validar por separado el cifrado de contenido indicado en el TMD y el cifrado interno NCCH: la ausencia del primero no demuestra que el RomFS sea legible.
+3. Validar offsets, tamaños y límites de cada contenido y de su NCCH/RomFS, incluyendo contenidos ausentes del CIA. No anunciarlos como disponibles mediante `am:app` si no pueden abrirse.
+4. Pasar los CIA encontrados junto al juego al cargador del sistema y conservar sus imágenes durante la ejecución, usando el acceso por rangos también al abrir archivos del DLC.
+5. Implementar las consultas de `am:app` para lista, índices, versión e información de ticket que los juegos esperan.
+6. Abrir cada contenido por su ID e índice desde el servicio de archivos NCCH/SDMC; devolver errores claros para archivos cifrados, incompletos o de otro juego.
+7. Confirmar si el DLC de Fantasy Life exige una actualización y qué versión del juego se necesita. Si requiere código actualizado, recompilar ese programa para ARM32: no reutilizar el `title.so` del programa base para otro ejecutable.
+8. Asociar automáticamente `dlc.cia` con el juego en el paquete de Fantasy Life y comprobar en el juego que sus contenidos estén visibles.
 
-**Criterio de terminado:** el juego puede consultar el DLC y abrir sus archivos, el log muestra qué CIA/contenidos cargó, y Fantasy Life confirma dentro del juego que el DLC está disponible.
+**Criterio de terminado:** el juego puede consultar el DLC mediante `am:app` y abrir un archivo conocido por su índice de contenido; el log identifica el CIA y los contenidos cargados; Fantasy Life confirma dentro del juego que el DLC está disponible. Registrar la versión del juego y cualquier actualización requerida. Un CIA aceptado por el parser no satisface por sí solo este criterio.
 
 ### 3. Tratar Vulkan como una línea separada
 
@@ -54,11 +59,12 @@ Después de estabilizar GLES y las variantes de shader tras el rebase, hacer una
 
 ## Orden recomendado
 
-1. Finalizar y revisar el rebase ARM32 en el worktree de prueba.
-2. Probar en el Redmi la recompilación ARM32 de Fantasy Life y registrar FPS, renderer, estado de recompilación y errores.
-3. Portar y verificar el soporte de DLC CIA en runtime.
-4. Hacer una sola prueba de Rune Factory 4 con los cambios GLES ya integrados.
-5. Investigar Vulkan 1.1 como mejora opcional, separada de la ruta de corrección GLES.
+1. Corregir los bloqueantes de flags y precisión del shader; finalizar y revisar el rebase ARM32 únicamente en el worktree de prueba.
+2. Construir APK y juego ARM32 desde el mismo árbol. Probar juntos en el Redmi, con instalación y datos aislados, Fantasy Life sin DLC; registrar FPS comparables, renderer, precisión, ejecución recompilada, reserva fastmem y errores.
+3. Portar el soporte de DLC CIA con acceso por rangos y validación de ambas capas de cifrado. Confirmar los requisitos de actualización de Fantasy Life y verificar consultas, apertura de un archivo conocido y reconocimiento dentro del juego.
+4. Hacer una sola prueba acotada de Rune Factory 4 con captura de log, variante identificada y los cambios GLES ya verificados.
+5. Integrar solo después de la revisión completa y de registrar los resultados exigidos; no sustituir la evidencia del Redmi por una compilación correcta.
+6. Investigar Vulkan 1.1 como mejora opcional, separada de la ruta de corrección GLES.
 
 ## Archivos y estado útil
 
