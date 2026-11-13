@@ -8,10 +8,19 @@ cd "$(dirname "$0")/.."
 
 violations="$(grep -rn "libc::syscall\|SYS_[a-z]" frontend/src engine --include="*.rs" \
     | grep -v "frontend/src/readahead.rs" \
-    | grep -v "frontend/src/profiler.rs" || true)"
+    | grep -v "frontend/src/profiler.rs" \
+    | grep -v "engine/gpu/src/raster/gles/programs.rs" || true)"
 if [ -n "$violations" ]; then
-    echo "raw syscalls outside the allowlist (readahead.rs, profiler.rs):" >&2
+    echo "raw syscalls outside the allowlist (readahead.rs, profiler.rs, programs.rs gettid):" >&2
     echo "$violations" >&2
+    exit 1
+fi
+
+# gettid is the one raw syscall Android's filter allows. programs.rs uses
+# it from a signal handler, so it may only be that call.
+if grep -n "libc::syscall\|SYS_[a-z]" engine/gpu/src/raster/gles/programs.rs \
+    | grep -v SYS_gettid; then
+    echo "engine/gpu/src/raster/gles/programs.rs has a raw syscall other than gettid" >&2
     exit 1
 fi
 

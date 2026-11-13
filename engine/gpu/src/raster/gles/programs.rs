@@ -142,8 +142,9 @@ pub(super) fn at_compiler(sources: [&str; 2]) {
         pointer.store(source.as_ptr().cast_mut(), Relaxed);
         len.store(source.len(), Relaxed);
     }
-    // SAFETY: gettid has no arguments and cannot fail
-    let thread = if present.is_empty() { 0 } else { unsafe { libc::syscall(libc::SYS_gettid) } };
+    // SAFETY: gettid has no arguments and cannot fail. The result is i32
+    // on armv7, and the mark is an i64 so both ABIs store the same width.
+    let thread = if present.is_empty() { 0 } else { unsafe { libc::syscall(libc::SYS_gettid) as i64 } };
     AT_COMPILER.thread.store(thread, Relaxed);
 }
 
@@ -168,7 +169,7 @@ impl Drop for Watched {
 /// nothing here allocates
 pub unsafe fn note_compiler_crash(log: libc::c_int) {
     use std::sync::atomic::Ordering::Relaxed;
-    if AT_COMPILER.thread.load(Relaxed) != libc::syscall(libc::SYS_gettid) {
+    if AT_COMPILER.thread.load(Relaxed) != unsafe { libc::syscall(libc::SYS_gettid) as i64 } {
         return;
     }
     let write = |file: libc::c_int, bytes: &[u8]| {
