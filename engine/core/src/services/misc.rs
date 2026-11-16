@@ -117,16 +117,19 @@ pub fn handle(
                 buffer.reply(&mut system.memory, command, &[contents.len() as u32]);
                 true
             }
-            // GetDLCTitleInfos(media type, count, the title ids, where their
-            // infos go)
-            0x1005 => {
+            // GetDLCTitleInfos and GetPatchTitleInfos(media type, count,
+            // the title ids, where their infos go)
+            0x1005 | 0x100D => {
                 let count = buffer.get(&mut system.memory, 2);
                 let (ids, out) = (buffer.get(&mut system.memory, 4), buffer.get(&mut system.memory, 6));
                 let mut missing = false;
                 for i in 0..count {
                     use zakuro_cpu::Bus;
                     let title_id = system.memory.read32(ids + i * 8) as u64 | (system.memory.read32(ids + i * 8 + 4) as u64) << 32;
-                    let Some(version) = system.dlc.iter().find(|dlc| dlc.title_id == title_id).map(|dlc| dlc.version) else {
+                    let dlc = system.dlc.iter().find(|dlc| dlc.title_id == title_id).map(|dlc| dlc.version);
+                    let update = system.title.as_ref().and_then(|title| title.update()).filter(|update| update.title_id == title_id);
+                    let version = if command == 0x1005 { dlc } else { update.map(|update| update.version) };
+                    let Some(version) = version else {
                         missing = true;
                         continue;
                     };
@@ -163,9 +166,9 @@ pub fn handle(
                 }
                 true
             }
-            // GetNumDataTitleTickets, IsDataTitleInUse and GetPatchTitleInfos,
-            // which this build has nothing for
-            0x1006 | 0x1009 | 0x100D => {
+            // GetNumDataTitleTickets and IsDataTitleInUse, which this build
+            // has nothing for
+            0x1006 | 0x1009 => {
                 buffer.reply_error(&mut system.memory, command, TITLE_NOT_FOUND);
                 true
             }

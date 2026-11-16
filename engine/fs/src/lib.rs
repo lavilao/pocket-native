@@ -204,6 +204,8 @@ pub struct Title {
     pub exefs: ExeFs,
     exefs_offset: u64,
     pub romfs: Option<RomFs>,
+    /// the update installed for it, whose code and exheader it runs.
+    update: Option<Box<Update>>,
 }
 
 impl Title {
@@ -233,6 +235,12 @@ impl Title {
             return Err(FsError::UnknownFormat);
         };
 
+        Title::from_image(image, ncch_offset)
+    }
+
+    /// the title whose NCCH is at ncch_offset in image, which a game's own
+    /// ROM is and a CIA's content 0, an update's, is too.
+    fn from_image(image: Arc<RomImage>, ncch_offset: u64) -> Result<Title, FsError> {
         let ncch = NcchHeader::parse(&image.read_at(ncch_offset, NcchHeader::SIZE)?)?;
 
         if !ncch.is_decrypted() && ncch.crypto_method() != 0 {
@@ -269,7 +277,19 @@ impl Title {
             exefs,
             exefs_offset,
             romfs,
+            update: None,
         })
+    }
+
+    /// runs the update's code and exheader from now on, and has its RomFS
+    /// for the game to open besides its own.
+    pub fn attach_update(&mut self, update: Update) {
+        self.exheader = update.title.exheader.clone();
+        self.update = Some(Box::new(update));
+    }
+
+    pub fn update(&self) -> Option<&Update> {
+        self.update.as_deref()
     }
 
     pub fn image(&self) -> &RomImage {
@@ -292,8 +312,12 @@ impl Title {
         self.ncch_offset
     }
 
-    /// raw bytes of an ExeFS entry, read from the image on demand.
+    /// raw bytes of an ExeFS entry, read from the image on demand, the
+    /// update's when it has the entry.
     pub fn exefs_file(&self, name: &str) -> Option<Vec<u8>> {
+        if let Some(file) = self.update.as_ref().and_then(|update| update.title.exefs_file(name)) {
+            return Some(file);
+        }
         let entry = self.exefs.find(name)?;
         let start = self.exefs_offset + exefs::HEADER_SIZE + entry.offset;
         self.image.read_at(start, entry.size as usize).ok()
@@ -329,10 +353,40 @@ impl Title {
 
     /// human-readable one-liner for the log banner.
     pub fn describe(&self) -> String {
+        let update = self.update.as_ref().map(|update| format!(", updated to v{}", version_name(update.version))).unwrap_or_default();
         format!(
-            "{} [{}] title={:016X} v{}",
+            "{} [{}] title={:016X} v{}{update}",
             self.exheader.title, self.ncch.product_code, self.ncch.program_id, self.ncch.version
         )
+    }
+}
+
+/// a game's update, the code, exheader and data that take the place of the
+/// game's own, from the update's CIA.
+pub struct Update {
+    pub title: Title,
+    pub title_id: u64,
+    pub version: u16,
+}
+
+impl Update {
+    pub fn load(path: impl AsRef<Path>) -> Result<Update, FsError> {
+        let image = Arc::new(RomImage::open(path)?);
+        let head = image.read_at(0, (image.len().min(0x2020)) as usize)?;
+        if !Cia::detect(&head) {
+            return Err(FsError::BadCia("an update comes as a CIA"));
+        }
+        let cia = Cia::read_from(&image)?;
+        if cia.kind() != TitleKind::Update {
+            return Err(FsError::BadCia("it is not an update"));
+        }
+        let content = cia.content(0).ok_or(FsError::NoExecutablePartition)?;
+        let offset = content.offset.ok_or(FsError::NoExecutablePartition)?;
+        if content.encrypted() {
+            return Err(FsError::EncryptedCia);
+        }
+        let title = Title::from_image(image, offset)?;
+        Ok(Update { title, title_id: cia.title_id, version: cia.version })
     }
 }
 
@@ -523,5 +577,105 @@ mod tests {
         assert!(matches!(Dlc::load(&path), Err(FsError::BadCia(_))));
         std::fs::write(&path, dlc_cia(0x0004_008C_0016_4800, 1).0).unwrap();
         assert!(matches!(Dlc::load(&path), Err(FsError::EncryptedCia)));
+    }
+
+    /// an executable NCCH: a header, an exheader with a title, an ExeFS
+    /// holding .code, and a RomFS, the shape a game's CXI and an update's
+    /// content both have.
+    fn executable_ncch(title_id: u64, code: &[u8], title: &str) -> Vec<u8> {
+        use crate::romfs_build::{build, BuildFile};
+        let level3 = build(&[BuildFile { path: "data.bin".into(), data: vec![9, 8, 7] }]);
+        let (exefs_offset, romfs_offset) = (0x1000, 0x2000);
+        let romfs_size = (0x1000 + level3.len()).next_multiple_of(0x200);
+        let mut content = vec![0u8; romfs_offset + romfs_size];
+        content[0x100..0x104].copy_from_slice(b"NCCH");
+        content[0x118..0x120].copy_from_slice(&title_id.to_le_bytes());
+        content[0x180..0x184].copy_from_slice(&0x400u32.to_le_bytes());
+        content[0x1A0..0x1A4].copy_from_slice(&((exefs_offset / 0x200) as u32).to_le_bytes());
+        content[0x1A4..0x1A8].copy_from_slice(&(0x1000u32 / 0x200).to_le_bytes());
+        content[0x1B0..0x1B4].copy_from_slice(&((romfs_offset / 0x200) as u32).to_le_bytes());
+        content[0x1B4..0x1B8].copy_from_slice(&((romfs_size / 0x200) as u32).to_le_bytes());
+        // flags[7]: decrypted, and with a RomFS
+        content[0x18F] = 4;
+        // the exheader: its SCI's title, its ACI's program id
+        content[0x200..0x208].copy_from_slice(title.as_bytes());
+        content[0x400..0x408].copy_from_slice(&title_id.to_le_bytes());
+        // the ExeFS: .code as its first entry, the code past the header
+        let exefs = &mut content[exefs_offset..];
+        exefs[..8].copy_from_slice(b".code\0\0\0");
+        exefs[0x0C..0x10].copy_from_slice(&(code.len() as u32).to_le_bytes());
+        exefs[0x200..0x200 + code.len()].copy_from_slice(code);
+        // the RomFS: an IVFC header a page long, then the level-3 image
+        content[romfs_offset..romfs_offset + 4].copy_from_slice(b"IVFC");
+        content[romfs_offset + 4..romfs_offset + 8].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        content[romfs_offset + 0x0C + 2 * 0x18 + 0x10..][..4].copy_from_slice(&12u32.to_le_bytes());
+        content[romfs_offset + 0x1000..romfs_offset + 0x1000 + level3.len()].copy_from_slice(&level3);
+        content
+    }
+
+    /// the CIA around a title's one content, with the TMD version it asks for.
+    fn cia_around(content: &[u8], title_id: u64, version: u16) -> Vec<u8> {
+        const TMD_HEADER: usize = 0x140;
+        const RECORDS: usize = 0xC4 + 64 * 0x24;
+        let (certificates, ticket) = (0xA00u32, 0x350u32);
+        let tmd_size = TMD_HEADER + RECORDS + 0x30;
+        let tmd_offset = (0x2020u64 + certificates as u64).next_multiple_of(0x40) + ticket as u64;
+        let tmd_offset = tmd_offset.next_multiple_of(0x40);
+        let mut data = vec![0u8; 0x2020];
+        data[..4].copy_from_slice(&0x2020u32.to_le_bytes());
+        data[0x08..0x0C].copy_from_slice(&certificates.to_le_bytes());
+        data[0x0C..0x10].copy_from_slice(&ticket.to_le_bytes());
+        data[0x10..0x14].copy_from_slice(&(tmd_size as u32).to_le_bytes());
+        // content 0 is the one the file holds
+        data[0x20] = 0x80;
+        data.resize(tmd_offset as usize + tmd_size, 0);
+        let tmd = &mut data[tmd_offset as usize..];
+        tmd[..4].copy_from_slice(&0x0001_0004u32.to_be_bytes());
+        let header = &mut tmd[TMD_HEADER..];
+        header[0x4C..0x54].copy_from_slice(&title_id.to_be_bytes());
+        header[0x9C..0x9E].copy_from_slice(&version.to_be_bytes());
+        header[0x9E..0xA0].copy_from_slice(&1u16.to_be_bytes());
+        let record = &mut header[RECORDS..];
+        record[0x08..0x10].copy_from_slice(&(content.len() as u64).to_be_bytes());
+        let content_offset = (tmd_offset + tmd_size as u64).next_multiple_of(0x40);
+        data.resize(content_offset as usize + content.len(), 0);
+        data[content_offset as usize..].copy_from_slice(content);
+        data
+    }
+
+    /// an update's CIA loads with its version and its .code, and attaches to
+    /// the game it updates: the update's code and exheader are what run from
+    /// then on, under the game's own id.
+    #[test]
+    fn an_update_loads_and_attaches_to_its_game() {
+        let game_path = scratch("game.cxi");
+        std::fs::write(&game_path, executable_ncch(0x0004_0000_0016_4800, b"old code", "GAMECODE")).unwrap();
+        let mut title = Title::load(&game_path).unwrap();
+        assert_eq!(title.exefs_file(".code").unwrap(), b"old code");
+        assert!(title.update().is_none());
+
+        let update_path = scratch("update.cia");
+        let content = executable_ncch(0x0004_000E_0016_4800, b"new code", "NEWCODE!");
+        std::fs::write(&update_path, cia_around(&content, 0x0004_000E_0016_4800, 0x0401)).unwrap();
+        let update = Update::load(&update_path).unwrap();
+        assert_eq!(update.title_id, 0x0004_000E_0016_4800);
+        assert_eq!(version_name(update.version), "1.0.1");
+        assert_eq!(update.title.exefs_file(".code").unwrap(), b"new code");
+
+        title.attach_update(update);
+        // the game's id stays, its code and exheader are the update's
+        assert_eq!(title.program_id(), 0x0004_0000_0016_4800);
+        assert_eq!(title.exheader.title, "NEWCODE!");
+        assert_eq!(title.exefs_file(".code").unwrap(), b"new code");
+        assert!(title.describe().contains("updated to v1.0.1"));
+        // and its own RomFS is still there to read
+        assert!(title.romfs.is_some());
+
+        // a game's own CIA is not an update, and neither is DLC
+        std::fs::write(&update_path, cia_around(&content, 0x0004_0000_0016_4800, 0x0401)).unwrap();
+        assert!(matches!(Update::load(&update_path), Err(FsError::BadCia(_))));
+        let dlc = dlc_cia(0x0004_008C_0016_4800, 0).0;
+        std::fs::write(&update_path, dlc).unwrap();
+        assert!(matches!(Update::load(&update_path), Err(FsError::BadCia(_))));
     }
 }

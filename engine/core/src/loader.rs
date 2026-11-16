@@ -20,7 +20,11 @@ pub enum LoadError {
 const STACK_TOP: u32 = SHARED_MEMORY_VADDR;
 
 pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<System, LoadError> {
-    let title = Title::load(path)?;
+    let mut title = Title::load(path)?;
+    // the update beside the game attaches before anything reads the
+    // exheader: its code, memory layout and entry point are what run from
+    // here on
+    let dlc = load_addons(&mut title, &config.dlc);
     log::info!("loaded {}", title.describe());
 
     let exheader = &title.exheader;
@@ -95,23 +99,32 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
                 Err(error) => log::warn!("could not use the code linked in, {error}, interpreting everything"),
             }
         }
-    } else if let Some(path) = system.config.recompiled.clone().or_else(|| installed(&system, &title)) {
-        let path = if path.is_dir() { path.join(recomp_abi::library_name(title.program_id())) } else { path };
-        let opened = crate::recompiled::Library::open(&path).and_then(|library| {
-            if library.needs_fastmem() && system.memory.fastmem().is_null() {
-                Err("it was built for fastmem, which this host has no view for".to_owned())
-            } else {
-                Ok(library)
+    } else {
+        // the update's build when there is one: the game's own was built
+        // from code the update replaced, whose layout no longer matches
+        match library_for(&system, &title) {
+            Some(path) => {
+                let opened = crate::recompiled::Library::open(&path).and_then(|library| {
+                    if library.needs_fastmem() && system.memory.fastmem().is_null() {
+                        Err("it was built for fastmem, which this host has no view for".to_owned())
+                    } else {
+                        Ok(library)
+                    }
+                });
+                match opened {
+                    Ok(library) => {
+                        log::info!("running recompiled code from {}, {}", path.display(), library.describe());
+                        system.recompiled = Some(library);
+                        let text = exheader_text(&title);
+                        system.hints = Some(crate::hints::Hints::new(&path, text));
+                    }
+                    Err(error) => log::warn!("could not load {}, {error}, interpreting everything", path.display()),
+                }
             }
-        });
-        match opened {
-            Ok(library) => {
-                log::info!("running recompiled code from {}, {}", path.display(), library.describe());
-                system.recompiled = Some(library);
-                let text = exheader_text(&title);
-                system.hints = Some(crate::hints::Hints::new(&path, text));
-            }
-            Err(error) => log::warn!("could not load {}, {error}, interpreting everything", path.display()),
+            None if title.update().is_some() => log::warn!(
+                "the update changed the game's code and there is no recompiled build of it, interpreting everything: 3dsrecomp build <the update's .cia> makes one, --32bit for the phone"
+            ),
+            None => {}
         }
     }
 
@@ -127,38 +140,105 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         }
     }
 
-    system.dlc = load_dlc(&title, &system.config.dlc);
+    system.dlc = dlc;
     system.title = Some(title);
     Ok(system)
 }
 
-/// the DLC among the CIAs given beside the game, the ones whose id is the
-/// game's own, by the low half: an update or another game's DLC is left out
-/// with a line saying so.
-fn load_dlc(title: &Title, paths: &[std::path::PathBuf]) -> Vec<zakuro_fs::Dlc> {
+/// whether a title id is the same game's, its update's or its DLC's, which
+/// share the low half.
+fn same_game(title_id: u64, program_id: u64) -> bool {
+    title_id & 0xFFFF_FFFF == program_id & 0xFFFF_FFFF
+}
+
+/// the update and the DLC among the CIAs given beside the game: the newest
+/// update that is its own attaches, and its DLC loads. a CIA of another
+/// game's is left out with a line saying so.
+fn load_addons(title: &mut Title, paths: &[std::path::PathBuf]) -> Vec<zakuro_fs::Dlc> {
     let program_id = title.program_id();
+    let mut update: Option<(u16, std::path::PathBuf)> = None;
     let mut found = Vec::new();
     for path in paths {
-        match zakuro_fs::Dlc::load(path) {
-            Ok(dlc) if dlc.title_id & 0xFFFF_FFFF == program_id & 0xFFFF_FFFF => {
-                let held = dlc.contents.iter().filter(|content| content.offset.is_some()).count();
-                log::info!(
-                    "DLC v{} from {}, {held} of its {} contents",
-                    zakuro_fs::version_name(dlc.version),
-                    path.display(),
-                    dlc.contents.len()
-                );
-                found.push(dlc);
+        // each CIA's header and TMD say what it is, the same reads its own
+        // loader makes again when it is the one that wins
+        let read = zakuro_fs::RomImage::open(path).ok().and_then(|image| {
+            let head = image.read_at(0, (image.len().min(0x2020)) as usize).ok()?;
+            zakuro_fs::Cia::detect(&head).then(|| zakuro_fs::Cia::read_from(&image).ok()).flatten()
+        });
+        let Some(cia) = read else {
+            log::warn!("could not read {} as a CIA", path.display());
+            continue;
+        };
+        if !same_game(cia.title_id, program_id) {
+            log::warn!("{} is of {:016X}, not this game, it is left out", path.display(), cia.title_id);
+            continue;
+        }
+        match cia.kind() {
+            zakuro_fs::TitleKind::Update => {
+                if update.as_ref().is_none_or(|(known, _)| *known < cia.version) {
+                    update = Some((cia.version, path.clone()));
+                }
             }
-            Ok(dlc) => log::warn!(
-                "{} is DLC of {:016X}, not this game, it is left out",
+            zakuro_fs::TitleKind::Dlc => match zakuro_fs::Dlc::load(path) {
+                Ok(dlc) => {
+                    let held = dlc.contents.iter().filter(|content| content.offset.is_some()).count();
+                    log::info!(
+                        "DLC v{} from {}, {held} of its {} contents",
+                        zakuro_fs::version_name(dlc.version),
+                        path.display(),
+                        dlc.contents.len()
+                    );
+                    found.push(dlc);
+                }
+                Err(error) => log::warn!("could not load {} as DLC, {error}", path.display()),
+            },
+            _ => log::warn!("{} is a game's own CIA, not an update or DLC, it is left out", path.display()),
+        }
+    }
+    if let Some((_version, path)) = update {
+        match zakuro_fs::Update::load(&path) {
+            Ok(loaded) if same_game(loaded.title_id, program_id) => {
+                log::info!(
+                    "the update to v{} from {}, its code and data run from here on",
+                    zakuro_fs::version_name(loaded.version),
+                    path.display()
+                );
+                title.attach_update(loaded);
+            }
+            Ok(loaded) => log::warn!(
+                "{} updates {:016X}, not this game, it is left out",
                 path.display(),
-                dlc.title_id
+                loaded.title_id
             ),
-            Err(error) => log::warn!("could not load {} as DLC, {error}", path.display()),
+            Err(error) => log::warn!("could not load the update {}, {error}, playing without it", path.display()),
         }
     }
     found
+}
+
+/// the recompiled code a title runs: the update's build when an update is
+/// attached, named after the update's title id, beside the game's own build
+/// or in the system's place for libraries; the game's own build otherwise.
+/// without a build of the update there is none to run: the game's own was
+/// built from code the update replaced, whose layout no longer matches.
+fn library_for(system: &System, title: &Title) -> Option<std::path::PathBuf> {
+    if let Some(update) = title.update() {
+        let name = recomp_abi::library_name(update.title_id);
+        if let Some(configured) = system.config.recompiled.as_ref() {
+            let beside = if configured.is_dir() { configured.join(&name) } else { configured.with_file_name(&name) };
+            if beside.is_file() {
+                return Some(beside);
+            }
+        }
+        if system.config.find_recompiled {
+            if let Some(found) = recomp_abi::installed(update.title_id) {
+                return Some(found);
+            }
+        }
+        return None;
+    }
+    let path = system.config.recompiled.clone().or_else(|| installed(system, title))?;
+    Some(if path.is_dir() { path.join(recomp_abi::library_name(title.program_id())) } else { path })
 }
 
 /// where the executable's code is.
