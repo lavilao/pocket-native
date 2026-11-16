@@ -1067,22 +1067,34 @@ fn system_archive_data(path: NcchArchivePath, data_dir: Option<&std::path::Path>
 fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
     let title = system.title.as_ref()?;
     match kind {
+        // the RomFS the game asked for: its own, or its update's, which is
+        // its own while no update is installed
         SELF_NCCH_ROMFS | SELF_NCCH_UPDATE_ROMFS => {
-            let romfs = title.romfs.as_ref()?;
-            let size = title.ncch.romfs_size.saturating_sub(0x1000);
-            let backing = FileBacking::RomImage {
-                image: title.shared_image(),
-                offset: romfs.base,
-                size,
+            let update = title.update().filter(|_| kind == SELF_NCCH_UPDATE_ROMFS);
+            let (path, image, base, size) = match update {
+                Some(update) => {
+                    let title = &update.title;
+                    let romfs = title.romfs.as_ref()?;
+                    // from level 3 to the end of the RomFS
+                    let end = title.ncch_offset() + title.ncch.romfs_offset + title.ncch.romfs_size;
+                    ("patch:/", title.shared_image(), romfs.base, end.saturating_sub(romfs.base))
+                }
+                None => {
+                    let romfs = title.romfs.as_ref()?;
+                    ("romfs:/", title.shared_image(), romfs.base, title.ncch.romfs_size.saturating_sub(0x1000))
+                }
             };
             log::debug!(
-                "fs: opened SelfNCCH RomFS at file offset 0x{:X}, {} MiB",
-                romfs.base,
+                "fs: opened {path} at file offset 0x{base:X}, {} MiB",
                 size / (1024 * 1024)
             );
             Some(system.services.fs.add_file(OpenFile {
-                path: "romfs:/".into(),
-                backing,
+                path: path.into(),
+                backing: FileBacking::RomImage {
+                    image,
+                    offset: base,
+                    size,
+                },
             }))
         }
         SELF_NCCH_CODE | SELF_NCCH_EXEFS => {
@@ -1100,12 +1112,15 @@ fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
 }
 
 /// opens a title on the SD card through the NCCH archive: the game itself,
-/// which this build runs from its own file, or the content of an index of
-/// its DLC.
+/// which this build runs from its own file, its update, or the content of
+/// an index of its DLC.
 fn open_sd_title(system: &mut System, title_id: u64, content_index: u16, kind: u32) -> Option<u32> {
     let title = system.title.as_ref()?;
     if title_id == title.program_id() {
         return open_ncch_kind(system, kind);
+    }
+    if title.update().is_some_and(|update| update.title_id == title_id) {
+        return open_ncch_kind(system, if kind == SELF_NCCH_ROMFS { SELF_NCCH_UPDATE_ROMFS } else { kind });
     }
     if kind != SELF_NCCH_ROMFS {
         log::warn!("fs: {title_id:016X} opened as path type {kind}, which DLC does not have");

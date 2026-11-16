@@ -164,6 +164,23 @@ fn set_up(own: &Path, folder: &Path, data: &Path) {
                 std::env::set_var("POCKET_NATIVE_NOTE", "restored title.so from the game folder");
             }
         }
+        // an update's build comes along the same way, under the update's
+        // title id, whose low half is the game folder's own
+        if let Some(id) = id.to_str().and_then(|id| u64::from_str_radix(id, 16).ok()) {
+            let update = 0x0004_000E_0000_0000 | (id & 0xFFFF_FFFF);
+            let code = own.join("code").join(format!("{update:016X}")).with_extension("so");
+            for bundled in [folder.join("update.so"), folder.join(format!("{update:016X}.so"))] {
+                if !code.is_file() && bundled.is_file() {
+                    let copied = code
+                        .parent()
+                        .and_then(|parent| std::fs::create_dir_all(parent).ok())
+                        .and_then(|()| std::fs::copy(&bundled, &code).ok());
+                    if copied.is_some() {
+                        std::env::set_var("POCKET_NATIVE_NOTE", "restored the update's code from the game folder");
+                    }
+                }
+            }
+        }
     }
     // where the game ran code its build missed, in its folder on the card as
     // on ArkOS, which the kit's rebuild takes from games/<title id>: beside

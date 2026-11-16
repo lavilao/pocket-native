@@ -18,6 +18,38 @@ scripts/build.sh path/to/game.3ds
 If the game has no profile yet, the build prints `(no profile yet)` and the
 launcher is named after the title ID.
 
+## Updates and DLC
+
+A game's update and its DLC, the `.cia` files the eShop delivered them in,
+go in the game's folder beside its ROM:
+
+```
+Pocket Native/pocket-native/games/<title id>/game.3ds
+                                              update.cia
+                                              dlc.cia
+```
+
+The loader picks them up by title ID, the newest update among them, and
+runs the update's code and exheader in place of the cartridge's own, as a
+console with the update installed does. `am:app` answers a title asking
+about its update and its DLC, the update's RomFS is there to open beside
+the game's own, and a DLC's contents are read through the fs service by
+their content index. Decrypted CIAs only, like the games themselves.
+
+An update changes the game's code, so a `title.so` built from the
+cartridge no longer matches: the update needs a recompiled build of its
+own, named after its title ID:
+
+```bash
+scripts/build.sh path/to/update.cia --32bit
+```
+
+Until that build is there the game runs interpreted, which a phone does
+slowly; the log says so. On Android, copy the build into the game folder
+as `update.so` beside `title.so` and the app picks it up. DLC is data
+only, no build of its own, and some games only see their DLC with the
+update installed too.
+
 ## Probing it
 
 `--probe` runs a game as fast as it goes with no one holding the handheld.

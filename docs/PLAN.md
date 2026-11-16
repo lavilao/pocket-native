@@ -1,8 +1,8 @@
 # Plan de trabajo de Pocket Native
 
-**Actualizado:** 11 de noviembre de 2026
-**Rama estable:** `master` (`fab8094`)
-**Rama de integración:** prueba de rebase en `/home/luis/Proyectos/pocket-native-rebase-trial`
+**Actualizado:** 16 de noviembre de 2026
+**Rama estable:** `master` (`7687886`, master fusionado con upstream v0.6.0)
+**Rama de integración:** la prueba de rebase quedó obsoleta; `merge-upstream-v0.6.0` ya está en master
 
 ## Objetivo
 
@@ -34,16 +34,11 @@ Integrar las mejoras recientes de Pocket Native y Zakuro sin perder el soporte A
 
 ### 2. Portar soporte runtime para DLC CIA
 
-Basarse en la implementación de Zakuro, adaptándola a las estructuras actuales del fork:
+**Estado (16 de noviembre): hecho en master, falta verificar en el juego.** El flujo completo de Zakuro está: los CIA junto al ROM se clasifican por id, el update más nuevo adjunta su código y exheader (el RomFS del juego propio sigue siendo el del cartucho, el del update se abre como `patch:/` y por el archivo NCCH con el id del update), `am:app` contesta `GetPatchTitleInfos` además de las consultas DLC, y `3dsrecomp build` acepta un CIA de update y nombra su biblioteca con el id del update (`0004000E<mitad baja>.so`); en Android, `update.so` en la carpeta del juego se copia a `code/` bajo ese nombre. Sin esa biblioteca el juego corre interpretado (el `title.so` del cartucho ya no coincide) y el log lo dice.
 
-1. Leer el encabezado CIA y el TMD; obtener ID, versión, flags, índices y offsets de contenido sin copiar ni mapear todo el archivo. Adaptar el uso de `image.data()` de Zakuro al acceso por rangos del fork para no competir con la reserva fastmem ARM32.
-2. Aceptar DLC solo si su categoría es DLC y corresponde al juego por los 32 bits bajos del ID. Validar por separado el cifrado de contenido indicado en el TMD y el cifrado interno NCCH: la ausencia del primero no demuestra que el RomFS sea legible.
-3. Validar offsets, tamaños y límites de cada contenido y de su NCCH/RomFS, incluyendo contenidos ausentes del CIA. No anunciarlos como disponibles mediante `am:app` si no pueden abrirse.
-4. Pasar los CIA encontrados junto al juego al cargador del sistema y conservar sus imágenes durante la ejecución, usando el acceso por rangos también al abrir archivos del DLC.
-5. Implementar las consultas de `am:app` para lista, índices, versión e información de ticket que los juegos esperan.
-6. Abrir cada contenido por su ID e índice desde el servicio de archivos NCCH/SDMC; devolver errores claros para archivos cifrados, incompletos o de otro juego.
-7. Confirmar si el DLC de Fantasy Life exige una actualización y qué versión del juego se necesita. Si requiere código actualizado, recompilar ese programa para ARM32: no reutilizar el `title.so` del programa base para otro ejecutable.
-8. Asociar automáticamente `dlc.cia` con el juego en el paquete de Fantasy Life y comprobar en el juego que sus contenidos estén visibles.
+Pendiente solo lo de siempre: confirmar en el Redmi que Fantasy Life ve el DLC con el update instalado, y si su DLC exige una versión mínima del juego.
+
+Los pasos originales de la portada quedaron así: el parser de encabezado/TMD con acceso por rangos (1-4) llegó en `c6402ad`; las consultas `am:app` (5) y la apertura por índice (6) con él; el soporte de updates — lo que faltaba del commit `5d06c80` de Zakuro, con `Update`/`attach_update`, el RomFS `patch:/`, `GetPatchTitleInfos` y el build de `3dsrecomp` desde un CIA de update (7) — llegó con la fusión de v0.6.0; la asociación automática por carpeta (8) es cómo funciona todo el flujo, sin pasos manuales.
 
 **Criterio de terminado:** el juego puede consultar el DLC mediante `am:app` y abrir un archivo conocido por su índice de contenido; el log identifica el CIA y los contenidos cargados; Fantasy Life confirma dentro del juego que el DLC está disponible. Registrar la versión del juego y cualquier actualización requerida. Un CIA aceptado por el parser no satisface por sí solo este criterio.
 

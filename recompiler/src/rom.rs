@@ -203,10 +203,12 @@ impl RomFs {
 /// a .cia's header size, which is also its first field.
 const CIA_HEADER_SIZE: u32 = 0x2020;
 
-/// where the executable content of a .cia starts. the header, certificates,
-/// ticket, TMD and contents each start on 64 bytes, and the contents follow
-/// in the order of the TMD's records, those the header's bitmap has.
-fn cia_executable(header: &[u8], mut read: impl FnMut(u64, usize) -> Result<Vec<u8>, Error>) -> Result<u64, Error> {
+/// where the executable content of a .cia starts, and its title id when it
+/// is an update's, whose recompiled build is named after that instead. the
+/// header, certificates, ticket, TMD and contents each start on 64 bytes,
+/// and the contents follow in the order of the TMD's records, those the
+/// header's bitmap has.
+fn cia_executable(header: &[u8], mut read: impl FnMut(u64, usize) -> Result<Vec<u8>, Error>) -> Result<(u64, Option<u64>), Error> {
     let align = |n: u64| n.next_multiple_of(0x40);
     let bitmap = read(0x20, 0x2000)?;
     let tmd_offset = align(align(align(CIA_HEADER_SIZE as u64) + u32_at(header, 0x08) as u64) + u32_at(header, 0x0C) as u64);
@@ -221,11 +223,13 @@ fn cia_executable(header: &[u8], mut read: impl FnMut(u64, usize) -> Result<Vec<
         0x0002 | 0x0005 => 0x80,
         _ => return error("the .cia's TMD has an unknown signature"),
     };
-    match be64(signature + 0x4C) >> 32 {
-        0x0004_000E => return error("this .cia is an update, not a game"),
-        0x0004_008C => return error("this .cia is downloadable content, not a game"),
-        _ => {}
+    let title_id = be64(signature + 0x4C);
+    if title_id >> 32 == 0x0004_008C {
+        return error("this .cia is downloadable content, not a game");
     }
+    // an update's code replaces the game's own, so a build of it goes under
+    // the update's title id, which the running system looks it up by
+    let update = (title_id >> 32 == 0x0004_000E).then_some(title_id);
     let mut offset = contents;
     for i in 0..be16(signature + 0x9E) as usize {
         let record = signature + 0xC4 + 64 * 0x24 + i * 0x30;
@@ -237,7 +241,7 @@ fn cia_executable(header: &[u8], mut read: impl FnMut(u64, usize) -> Result<Vec<
             if be16(record + 6) & 1 != 0 {
                 return error("the .cia is encrypted, it has to be decrypted first");
             }
-            return Ok(offset);
+            return Ok((offset, update));
         }
         offset = align(offset + be64(record + 8));
     }
@@ -265,11 +269,12 @@ impl Title {
         };
 
         // a cartridge image holds the executable as its first partition, a
-        // .cia as its first content, and a .cxi is that partition by itself
+        // .cia as its first content, and a .cxi is that partition by itself;
+        // a .cia of an update names its build after the update's title id
         let start = read(&mut file, 0, 0x200)?;
-        let ncch = match &start[0x100..0x104] {
-            b"NCSD" => u32_at(&start, 0x120) as u64 * MEDIA_UNIT,
-            b"NCCH" => 0,
+        let (ncch, update_title_id) = match &start[0x100..0x104] {
+            b"NCSD" => (u32_at(&start, 0x120) as u64 * MEDIA_UNIT, None),
+            b"NCCH" => (0, None),
             _ if u32_at(&start, 0) == CIA_HEADER_SIZE => cia_executable(&start, |offset, len| read(&mut file, offset, len))?,
             _ => return error("not a 3DS cartridge image, .cia or executable"),
         };
@@ -283,7 +288,7 @@ impl Title {
         if flags[7] & 0x04 == 0 && flags[3] != 0 {
             return error("the dump is encrypted, it has to be decrypted first");
         }
-        let program_id = u64_at(&header, 0x118);
+        let program_id = update_title_id.unwrap_or_else(|| u64_at(&header, 0x118));
         let exefs = ncch + u32_at(&header, 0x1A0) as u64 * MEDIA_UNIT;
         let romfs_offset = ncch + u32_at(&header, 0x1B0) as u64 * MEDIA_UNIT;
         let romfs_size = u32_at(&header, 0x1B4) as u64 * MEDIA_UNIT;
