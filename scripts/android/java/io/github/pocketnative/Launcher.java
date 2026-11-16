@@ -22,8 +22,8 @@ import android.graphics.drawable.StateListDrawable;
 import android.hardware.display.DisplayManager;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.Environment;
 import android.provider.DocumentsContract;
+import android.provider.OpenableColumns;
 import android.util.TypedValue;
 import android.view.Display;
 import android.view.Gravity;
@@ -58,10 +58,9 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
- * Pocket Native's launcher: the games added to it, Add game for one the PC kit
- * built (its folder, or a pack file), Device for how games show, and Update
- * for a newer release from GitHub. A game plays in Game, in a process of its
- * own.
+ * Pocket Native's launcher: Add game imports games built by its PC kit and
+ * update or DLC CIAs, Device sets how games show, and Update gets a newer
+ * release from GitHub. A game plays in Game, in a process of its own.
  *
  * Each game is a folder named after its title id in games/, in the app's
  * folder on a removable card when there is one, else on shared storage:
@@ -73,6 +72,7 @@ public final class Launcher extends Activity {
     private static final int GREY = 0xFF3A3A3A;
     private static final int BLUE = 0xFF2F6FE0;
     private static final int ADD_FOLDER = 1;
+    private static final int ADD_CIA = 3;
     private static final int ADD_PACK = 2;
     /** a shortcut's intent: the game in the "game" extra, played at once. */
     private static final String PLAY_GAME = "io.github.pocketnative.PLAY";
@@ -81,6 +81,7 @@ public final class Launcher extends Activity {
     private final List<File> games = new ArrayList<>();
     private GameList list;
     private TextView empty;
+    private File addOnTarget;
     /** the game list, and the Device page in its place while Device is lit. */
     private View gamesPage;
     private ScrollView devicePage;
@@ -89,6 +90,12 @@ public final class Launcher extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        if (state != null) {
+            String target = state.getString("addOnTarget");
+            if (target != null) {
+                addOnTarget = new File(target);
+            }
+        }
         unpackProfiles();
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -136,6 +143,14 @@ public final class Launcher extends Activity {
         setContentView(root);
         refresh();
         playShortcut(getIntent());
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle state) {
+        if (addOnTarget != null) {
+            state.putString("addOnTarget", addOnTarget.getAbsolutePath());
+        }
+        super.onSaveInstanceState(state);
     }
 
     /** a game from a shortcut on the home screen, its folder in the extra. */
@@ -415,16 +430,40 @@ public final class Launcher extends Activity {
 
     private void addGame() {
         new AlertDialog.Builder(this)
-                .setTitle("Add game")
-                .setItems(new String[] {"A folder the kit built", "A pack file"}, (dialog, which) -> {
+                .setTitle("Add to Pocket Native")
+                .setItems(new String[] {"A game folder", "A game pack file", "An update or DLC CIA"}, (dialog, which) -> {
                     if (which == 0) {
                         startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), ADD_FOLDER);
-                    } else {
+                    } else if (which == 1) {
                         Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
                         pick.addCategory(Intent.CATEGORY_OPENABLE);
                         pick.setType("*/*");
                         startActivityForResult(pick, ADD_PACK);
+                    } else {
+                        chooseAddOnGame();
                     }
+                })
+                .show();
+    }
+
+    private void chooseAddOnGame() {
+        if (games.isEmpty()) {
+            Toast.makeText(this, "Add a 3DS game first", Toast.LENGTH_LONG).show();
+            return;
+        }
+        String[] titles = new String[games.size()];
+        for (int i = 0; i < games.size(); i++) {
+            File game = games.get(i);
+            titles[i] = name(game) + " (" + game.getName() + ")";
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Choose the game for this update or DLC")
+                .setItems(titles, (dialog, which) -> {
+                    addOnTarget = games.get(which);
+                    Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    pick.addCategory(Intent.CATEGORY_OPENABLE);
+                    pick.setType("*/*");
+                    startActivityForResult(pick, ADD_CIA);
                 })
                 .show();
     }
@@ -432,6 +471,10 @@ public final class Launcher extends Activity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == ADD_CIA && (result != RESULT_OK || data == null || data.getData() == null)) {
+            addOnTarget = null;
+            return;
+        }
         if (result != RESULT_OK || data == null || data.getData() == null) {
             return;
         }
@@ -440,7 +483,78 @@ public final class Launcher extends Activity {
             inBackground("Adding", progress -> withCleanUp(() -> added(importFolder(uri, progress))));
         } else if (request == ADD_PACK) {
             inBackground("Adding", progress -> withCleanUp(() -> added(importPack(uri, progress))));
+        } else if (request == ADD_CIA) {
+            File target = addOnTarget;
+            addOnTarget = null;
+            if (target != null && new File(target, "game.3ds").isFile()) {
+                String fileName = documentName(uri);
+                if (fileName == null || !fileName.toLowerCase(java.util.Locale.ROOT).endsWith(".cia") || fileName.contains("/") || fileName.contains("\\")) {
+                    Toast.makeText(this, "Choose a .cia update or DLC file", Toast.LENGTH_LONG).show();
+                } else {
+                    File destination = new File(target, fileName);
+                    if (destination.exists()) {
+                        new AlertDialog.Builder(this)
+                                .setMessage("Replace " + fileName + " for " + name(target) + "?")
+                                .setPositiveButton("Replace", (dialog, which) -> importCia(uri, target, fileName))
+                                .setNegativeButton("Cancel", null)
+                                .show();
+                    } else {
+                        importCia(uri, target, fileName);
+                    }
+                }
+            } else {
+                Toast.makeText(this, "That game is no longer available", Toast.LENGTH_LONG).show();
+            }
         }
+    }
+
+    private String documentName(Uri uri) {
+        try (Cursor cursor = getContentResolver().query(uri, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                return cursor.getString(0);
+            }
+        }
+        return uri.getLastPathSegment();
+    }
+
+    private void importCia(Uri uri, File target, String fileName) {
+        inBackground("Adding update or DLC", progress -> {
+            File destination = new File(target, fileName);
+            File temporary = new File(target, "." + fileName + ".importing");
+            File backup = new File(target, "." + fileName + ".previous");
+            if (!new File(target, "game.3ds").isFile()) {
+                throw new IOException("the selected game is no longer available");
+            }
+            temporary.delete();
+            try (InputStream source = getContentResolver().openInputStream(uri)) {
+                if (source == null) {
+                    throw new IOException("could not open the selected CIA");
+                }
+                try (Cursor cursor = getContentResolver().query(uri, new String[] {OpenableColumns.SIZE}, null, null, null)) {
+                    long size = cursor != null && cursor.moveToFirst() && !cursor.isNull(0) ? cursor.getLong(0) : -1;
+                    copy(source, temporary, fileName, size, progress);
+                }
+            } catch (IOException | RuntimeException error) {
+                temporary.delete();
+                if (error instanceof IOException) {
+                    throw (IOException) error;
+                }
+                throw new IOException("could not read the selected CIA", error);
+            }
+            if (destination.exists() && !destination.renameTo(backup)) {
+                temporary.delete();
+                throw new IOException("could not preserve the existing CIA");
+            }
+            if (!temporary.renameTo(destination)) {
+                if (backup.exists()) {
+                    backup.renameTo(destination);
+                }
+                temporary.delete();
+                throw new IOException("could not place the CIA beside the game");
+            }
+            backup.delete();
+            return fileName + " added beside " + name(target) + ". Restart the game to load it.";
+        });
     }
 
     private interface Progress {

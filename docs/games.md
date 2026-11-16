@@ -29,6 +29,12 @@ Pocket Native/pocket-native/games/<title id>/game.3ds
                                               dlc.cia
 ```
 
+On Android, use **Add game → An update or DLC CIA**, choose the game, then
+choose the `.cia` file in the system file picker. Pocket Native copies it
+beside that game's `game.3ds`; if a file with the same name is already there,
+it asks before replacing it. Restart the game after importing so the loader
+can read the added CIA.
+
 The loader picks them up by title ID, the newest update among them, and
 runs the update's code and exheader in place of the cartridge's own, as a
 console with the update installed does. `am:app` answers a title asking
