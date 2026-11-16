@@ -62,24 +62,28 @@ pub fn detect(path: &Path, kit: &Path, list: &[(String, String)]) -> Game {
 }
 
 /// the title id and the executable's header with where it starts, for a
-/// cartridge dump or a .cia.
+/// cartridge dump or a .cia. the headers are read on demand, a 32-bit host
+/// having no spare room for a whole-file mapping.
 fn header(path: &Path) -> (Option<u64>, Option<(NcchHeader, u64)>) {
     let Ok(image) = RomImage::open(path) else { return (None, None) };
-    let data = image.data();
-    if zakuro_fs::ncsd::Ncsd::detect(data) {
-        let Ok(ncsd) = zakuro_fs::ncsd::Ncsd::parse(data) else { return (None, None) };
+    let Ok(head) = image.read_at(0, 0x200) else { return (None, None) };
+    if zakuro_fs::ncsd::Ncsd::detect(&head) {
+        let Ok(ncsd) = zakuro_fs::ncsd::Ncsd::parse(&head) else { return (None, None) };
         let ncch = ncsd.executable_partition().ok().and_then(|part| {
-            let at = part.offset as usize;
-            data.get(at..).and_then(|rest| NcchHeader::parse(rest).ok()).map(|header| (header, part.offset))
+            image.read_at(part.offset, NcchHeader::SIZE).ok()
+                .and_then(|d| NcchHeader::parse(&d).ok())
+                .map(|header| (header, part.offset))
         });
         (Some(ncsd.media_id), ncch)
-    } else if Cia::detect(data) {
-        let Ok(cia) = Cia::parse(data) else { return (None, None) };
-        let at = cia.executable.0 as usize;
-        let ncch = data.get(at..).and_then(|rest| NcchHeader::parse(rest).ok()).map(|header| (header, cia.executable.0));
+    } else if Cia::detect(&head) {
+        let Ok(cia) = Cia::parse_from(&image) else { return (None, None) };
+        let Some(at) = cia.executable().map(|(offset, _)| offset) else { return (Some(cia.title_id), None) };
+        let ncch = image.read_at(at, NcchHeader::SIZE).ok()
+            .and_then(|d| NcchHeader::parse(&d).ok())
+            .map(|header| (header, at));
         (Some(cia.title_id), ncch)
-    } else if NcchHeader::detect(data) {
-        let ncch = NcchHeader::parse(data).ok();
+    } else if NcchHeader::detect(&head) {
+        let ncch = NcchHeader::parse(&head).ok();
         (ncch.as_ref().map(|header| header.program_id), ncch.map(|header| (header, 0)))
     } else {
         (None, None)
@@ -89,12 +93,12 @@ fn header(path: &Path) -> (Option<u64>, Option<(NcchHeader, u64)>) {
 /// the English name and the big icon in a decrypted game's icon data.
 fn smdh(path: &Path, header: &NcchHeader, offset: u64) -> Option<(String, Vec<u8>)> {
     let image = RomImage::open(path).ok()?;
-    let data = image.data();
-    let exefs_at = (offset + header.exefs_offset) as usize;
-    let exefs = ExeFs::parse(data.get(exefs_at..)?).ok()?;
+    let exefs_at = offset + header.exefs_offset as u64;
+    let head = image.read_at(exefs_at, zakuro_fs::exefs::HEADER_SIZE as usize).ok()?;
+    let exefs = ExeFs::parse(&head).ok()?;
     let entry = exefs.find("icon")?;
-    let start = exefs_at + 0x200 + entry.offset as usize;
-    let icon = data.get(start..start + 0x36C0)?;
+    let start = exefs_at + zakuro_fs::exefs::HEADER_SIZE + entry.offset;
+    let icon = image.read_at(start, 0x36C0).ok()?;
     if &icon[0..4] != b"SMDH" {
         return None;
     }

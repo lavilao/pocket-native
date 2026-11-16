@@ -2458,6 +2458,7 @@ dependencies = [
  "jni 0.21.1",
  "log",
  "pocket-native",
+ "zakuro-core",
  "zakuro-gpu",
 ]
 
@@ -4157,7 +4158,6 @@ name = "zakuro-fs"
 version = "0.6.0"
 dependencies = [
  "log",
- "memmap2",
  "thiserror 2.0.20",
  "zakuro-common",
 ]

@@ -239,8 +239,10 @@ impl Title {
             return Err(FsError::Encrypted(ncch.crypto_method()));
         }
         let need = ncch_offset + ncch.content_size.min(if ncch.has_romfs() { ncch.romfs_offset + ncch.romfs_size } else { ncch.exefs_offset + ncch.exefs_size });
-        if (data.len() as u64) < need {
-            return Err(FsError::CutShort { have: data.len() as u64 >> 20, need: need.div_ceil(1 << 20) });
+        // the image is read with pread rather than mapped whole, its length
+        // the same check on a cut-short dump
+        if image.len() < need {
+            return Err(FsError::CutShort { have: image.len() >> 20, need: need.div_ceil(1 << 20) });
         }
 
         let exheader_raw = image.read_at(ncch_offset + NcchHeader::SIZE as u64, ExHeader::HASHED_SIZE)?;
