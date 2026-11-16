@@ -7,6 +7,10 @@ license.workspace = true
 [features]
 default = []
 gles = ["dep:glow", "dep:glutin_egl_sys", "dep:libloading"]
+# the Vulkan 1.1 renderer, which draws through ash and shares the mesa's
+# fragment program with the OpenGL ES renderer. the panel the screens are
+# shown on stays OpenGL ES, so it builds the GL renderer too.
+vulkan = ["gles", "dep:ash", "dep:naga"]
 
 [dependencies]
 zakuro-common.workspace = true
@@ -26,6 +30,11 @@ cityhasher = "0.1"
 glow = { version = "0.16", optional = true }
 glutin_egl_sys = { version = "0.7", optional = true }
 libloading = { version = "0.8", optional = true }
+# the Vulkan 1.1 renderer's driver interface, loaded at run time so a build
+# with it still starts on a handheld with no Vulkan driver, and naga, which
+# turns the GLSL the renderer builds into the SPIR-V Vulkan wants
+ash = { version = "0.38", optional = true, default-features = false, features = ["loaded", "std"] }
+naga = { version = "30.0.1", optional = true, features = ["glsl-in", "wgsl-in", "spv-out"] }
 
 
 [dev-dependencies]

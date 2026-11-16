@@ -14,6 +14,252 @@ pub(crate) mod host;
 pub(crate) mod gles;
 #[cfg(feature = "gles")]
 pub(crate) type HostRenderer = gles::Gles;
+#[cfg(feature = "vulkan")]
+pub(crate) mod vulkan;
+
+/// the host GPU the draws go to: the Vulkan 1.1 renderer when it was built
+/// and starts, the OpenGL ES one otherwise, and the panel's.
+#[cfg(feature = "gles")]
+pub(crate) enum Hardware {
+    Gles(gles::Gles),
+    #[cfg(feature = "vulkan")]
+    Vulkan(vulkan::Vulkan),
+}
+
+#[cfg(feature = "gles")]
+impl Hardware {
+    /// the renderer to draw with, Vulkan first unless ZAKURO_BACKEND=gles
+    /// asks for OpenGL ES, falling back to OpenGL ES when Vulkan does not
+    /// start.
+    pub fn new() -> Result<Hardware, String> {
+        #[cfg(feature = "vulkan")]
+        {
+            static PICKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let force_gles = *PICKED.get_or_init(|| std::env::var("ZAKURO_BACKEND").is_ok_and(|backend| backend.eq_ignore_ascii_case("gles")));
+            if !force_gles {
+                match vulkan::Vulkan::new() {
+                    Ok(vulkan) => return Ok(Hardware::Vulkan(vulkan)),
+                    Err(error) => log::warn!("the Vulkan renderer did not start, {error}, drawing with OpenGL ES"),
+                }
+            }
+        }
+        Ok(Hardware::Gles(gles::Gles::new()?))
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Hardware::Gles(hardware) => hardware.name(),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.name(),
+        }
+    }
+
+    pub fn shades(&self) -> bool {
+        match self {
+            Hardware::Gles(hardware) => hardware.shades(),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.shades(),
+        }
+    }
+
+    pub fn fetches(&self) -> bool {
+        match self {
+            Hardware::Gles(hardware) => hardware.fetches(),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.fetches(),
+        }
+    }
+
+    /// whether the renderer samples the console's textures in the PICA's
+    /// own formats, which the Vulkan one does not: it takes RGBA texels.
+    pub fn packs(&self) -> bool {
+        match self {
+            Hardware::Gles(_) => true,
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.packs(),
+        }
+    }
+
+    /// whether the screens are shown by this renderer, rather than by the
+    /// panel's.
+    pub fn presents(&self) -> bool {
+        match self {
+            Hardware::Gles(_) => true,
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.presents(),
+        }
+    }
+
+    pub fn scale(&self) -> u32 {
+        match self {
+            Hardware::Gles(hardware) => hardware.scale(),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.scale(),
+        }
+    }
+
+    pub fn set_scale(&mut self, scale: f32) -> f32 {
+        match self {
+            Hardware::Gles(hardware) => hardware.set_scale(scale),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.set_scale(scale),
+        }
+    }
+
+    pub fn draw<M: GpuMemory>(&mut self, memory: &mut M, draw: &host::Draw<'_>) -> Result<(), String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.draw(memory, draw),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.draw(memory, draw),
+        }
+    }
+
+    pub fn flush<M: GpuMemory>(&mut self, memory: &mut M) -> Result<(), String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.flush(memory),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.flush(memory),
+        }
+    }
+
+    pub fn flush_draws(&mut self) {
+        match self {
+            Hardware::Gles(hardware) => hardware.flush_draws(),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.flush_draws(),
+        }
+    }
+
+    /// whether the drawings have to come back to guest memory when a
+    /// command list ends, as the Vulkan renderer's do.
+    pub fn needs_readback(&self) -> bool {
+        match self {
+            Hardware::Gles(_) => false,
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.needs_readback(),
+        }
+    }
+
+    pub fn stop(&mut self) {
+        match self {
+            Hardware::Gles(hardware) => hardware.stop(),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.stop(),
+        }
+    }
+
+    pub fn holds(&self, texture: &DrawnTexture) -> bool {
+        match self {
+            Hardware::Gles(hardware) => hardware.holds(texture),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.holds(texture),
+        }
+    }
+
+    pub fn prepare_read<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32, texture: Option<&DrawnTexture>) -> Result<(), String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.prepare_read(memory, addr, len, texture),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.prepare_read(memory, addr, len, texture),
+        }
+    }
+
+    pub fn filled(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.filled(addr, bytes),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.filled(addr, bytes),
+        }
+    }
+
+    pub fn fill_only(&mut self, addr: u32, len: u32, pattern: &[u8]) -> Result<bool, String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.fill_only(addr, len, pattern),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.fill_only(addr, len, pattern),
+        }
+    }
+
+    pub fn before_fill<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32, width: u32) -> Result<(), String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.before_fill(memory, addr, len, width),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.before_fill(memory, addr, len, width),
+        }
+    }
+
+    pub fn before_overwrite<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.before_overwrite(memory, addr, len),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.before_overwrite(memory, addr, len),
+        }
+    }
+
+    pub fn sync<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.sync(memory, addr, len),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.sync(memory, addr, len),
+        }
+    }
+
+    pub fn display_transfer<M: GpuMemory>(&mut self, memory: &mut M, transfer: &host::Transfer) -> Result<bool, String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.display_transfer(memory, transfer),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.display_transfer(memory, transfer),
+        }
+    }
+
+    pub fn texture_copy<M: GpuMemory>(&mut self, memory: &mut M, input: u32, output: u32, size: u32, input_lines: (u32, u32), output_lines: (u32, u32)) -> Result<bool, String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.texture_copy(memory, input, output, size, input_lines, output_lines),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.texture_copy(memory, input, output, size, input_lines, output_lines),
+        }
+    }
+
+    pub fn screen(&mut self, addr: u32, size: (u32, u32), stride: u32, format: ColorFormat, guest: &[u8]) -> Option<crate::ScreenRef> {
+        match self {
+            Hardware::Gles(hardware) => hardware.screen(addr, size, stride, format, guest),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.screen(addr, size, stride, format, guest),
+        }
+    }
+
+    pub fn picture(&mut self, screen: crate::ScreenRef) -> Result<Option<crate::Picture>, String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.picture(screen),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.picture(screen),
+        }
+    }
+
+    pub fn present(&mut self, shown: [Option<(crate::PanelImage, [i32; 4])>; 2], cursor: Option<(i32, i32)>, overlays: Vec<std::sync::Arc<crate::Overlay>>, smooth: bool, interpolate: bool, frames: u32) {
+        match self {
+            Hardware::Gles(hardware) => hardware.present(shown, cursor, overlays, smooth, interpolate, frames),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.present(shown, cursor, overlays, smooth, interpolate, frames),
+        }
+    }
+
+    pub fn can_mirror(&self, first: [(u32, u32); 2], other: [(u32, u32); 2]) -> bool {
+        match self {
+            Hardware::Gles(hardware) => hardware.can_mirror(first, other),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.can_mirror(first, other),
+        }
+    }
+
+    pub fn mirror(&mut self, first: [(u32, u32); 2], other: [(u32, u32); 2]) -> Result<(), String> {
+        match self {
+            Hardware::Gles(hardware) => hardware.mirror(first, other),
+            #[cfg(feature = "vulkan")]
+            Hardware::Vulkan(hardware) => hardware.mirror(first, other),
+        }
+    }
+}
 use crate::texture::TextureFormat;
 use crate::shader::{self, ShaderUnit, Vec4};
 use crate::{format::ColorFormat, GpuMemory};
@@ -765,17 +1011,17 @@ fn inspect<M: GpuMemory>(registers: &[u32], memory: &mut M, shaded: &[Vertex], v
 /// screen-space vertex, with every varying pre-divided by w so the
 /// rasterizer only has to interpolate linearly and divide once per pixel.
 #[derive(Clone, Copy, Debug)]
-struct Screen {
-    x: f32,
-    y: f32,
+pub(crate) struct Screen {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
     /// z/w, which is linear in screen space, the depth map turns it into
     /// the value the depth buffer holds.
-    z: f32,
-    inv_w: f32,
-    color_over_w: Vec4,
-    texcoords_over_w: [[f32; 2]; 3],
-    quaternion_over_w: Vec4,
-    view_over_w: Vec4,
+    pub(crate) z: f32,
+    pub(crate) inv_w: f32,
+    pub(crate) color_over_w: Vec4,
+    pub(crate) texcoords_over_w: [[f32; 2]; 3],
+    pub(crate) quaternion_over_w: Vec4,
+    pub(crate) view_over_w: Vec4,
 }
 
 /// whether the framebuffer is upside down, the window's rows running from
@@ -886,26 +1132,26 @@ pub(crate) struct DrawnTexture {
 }
 
 /// texture unit 0's configuration and backing data for one draw call.
-struct BoundTexture {
+pub(crate) struct BoundTexture {
     /// the texture decoded, row by row from the top, none when it is drawn
     /// or packed.
-    texels: Arc<[[u8; 4]]>,
+    pub(crate) texels: Arc<[[u8; 4]]>,
     /// the texture in a format of its own size, for a GPU that samples it.
-    packed: Option<Packed>,
+    pub(crate) packed: Option<Packed>,
     /// the texture pack's picture drawn in its place, by a GPU.
-    replacement: Option<Arc<crate::pack::Material>>,
-    drawn: Option<DrawnTexture>,
+    pub(crate) replacement: Option<Arc<crate::pack::Material>>,
+    pub(crate) drawn: Option<DrawnTexture>,
     /// bilinear rather than point sampling when magnifying.
-    linear: bool,
-    wrap_s: Wrap,
-    wrap_t: Wrap,
-    width: u32,
-    height: u32,
-    border: [f32; 4],
+    pub(crate) linear: bool,
+    pub(crate) wrap_s: Wrap,
+    pub(crate) wrap_t: Wrap,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) border: [f32; 4],
     /// how many sizes the texels hold, each half the last, and how the GPU
     /// goes between them, see Lod.
-    levels: u32,
-    lod: Lod,
+    pub(crate) levels: u32,
+    pub(crate) lod: Lod,
 }
 
 /// how a unit goes between a texture's sizes, from GPUREG_TEXUNITi_LOD and
@@ -955,7 +1201,7 @@ pub struct Resources {
     pub(crate) fragment_state: u64,
     /// the host GPU, when draws go to it rather than to the software path.
     #[cfg(feature = "gles")]
-    pub(crate) hardware: Option<HostRenderer>,
+    pub(crate) hardware: Option<Hardware>,
     /// the colour buffers the top screen's last pictures came from.
     #[cfg(feature = "gles")]
     pub(crate) shown_top: [u32; 4],
@@ -1064,9 +1310,9 @@ type Found = (Arc<[[u8; 4]]>, Option<Packed>, Option<Arc<crate::pack::Material>>
 struct Decoded {
     /// the hash of the bytes it was decoded from.
     hash: u64,
-    texels: Arc<[[u8; 4]]>,
-    packed: Option<Packed>,
-    replacement: Option<Arc<crate::pack::Material>>,
+    pub(crate) texels: Arc<[[u8; 4]]>,
+    pub(crate) packed: Option<Packed>,
+    pub(crate) replacement: Option<Arc<crate::pack::Material>>,
     /// the list it was last read in, how many writes that list had made by
     /// then, the journal's stamp when it was last checked, and whether a
     /// flush of everything went over it since it was read.
@@ -1239,7 +1485,7 @@ fn fingerprint(bytes: &[u8]) -> u64 {
 
 /// how a texture coordinate outside 0..1 is brought back inside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Wrap {
+pub(crate) enum Wrap {
     ClampToEdge,
     /// outside the texture, the unit's border color.
     ClampToBorder,
@@ -1716,11 +1962,11 @@ impl DepthStencil {
 /// how clip-space depth becomes the value in the depth buffer, z/w scaled and
 /// offset by GPUREG_DEPTHMAP_SCALE and _OFFSET.
 #[derive(Debug, Clone, Copy)]
-struct DepthMap {
-    scale: f32,
-    offset: f32,
+pub(crate) struct DepthMap {
+    pub(crate) scale: f32,
+    pub(crate) offset: f32,
     /// a w-buffer multiplies the mapped value by w.
-    w_buffer: bool,
+    pub(crate) w_buffer: bool,
 }
 
 impl DepthMap {
@@ -2499,7 +2745,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let mut drawn: [Option<DrawnTexture>; 3] = [None; 3];
     // the GPU samples textures packed, the software path decodes them
     #[cfg(feature = "gles")]
-    let packs = resources.hardware.is_some();
+    let packs = resources.hardware.as_ref().is_some_and(|hardware| hardware.packs());
     #[cfg(not(feature = "gles"))]
     let packs = false;
     #[cfg(feature = "gles")]
@@ -3183,7 +3429,7 @@ mod tests {
             let mut resources = Resources::default();
             #[cfg(feature = "gles")]
             if gpu {
-                resources.hardware = HostRenderer::new().ok();
+                resources.hardware = Hardware::new().ok();
             }
             let mut memory = ConsoleMemory::default();
             for (x, y) in (4..8).flat_map(|x| (0..8).map(move |y| (x, y))) {
@@ -3247,7 +3493,7 @@ mod tests {
     #[cfg(feature = "gles")]
     #[test]
     fn the_gpu_covers_the_same_pixels() {
-        let Ok(hardware) = HostRenderer::new() else { return };
+        let Ok(hardware) = Hardware::new() else { return };
         const SIZE: u32 = 32;
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
@@ -3305,7 +3551,7 @@ mod tests {
     #[cfg(feature = "gles")]
     #[test]
     fn a_write_back_leaves_memory_the_cpu_wrote_since() {
-        let Ok(hardware) = HostRenderer::new() else { return };
+        let Ok(hardware) = Hardware::new() else { return };
         const SIZE: u32 = 32;
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
@@ -3345,7 +3591,7 @@ mod tests {
     #[test]
     #[ignore = "OpenGL ES writes back zero depth when every triangle is culled"]
     fn the_gpu_shades_like_the_cpu() {
-        let Ok(hardware) = HostRenderer::new() else { return };
+        let Ok(hardware) = Hardware::new() else { return };
         const SIZE: u32 = 32;
         const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
         let mut unit = ShaderUnit::new();

@@ -13,48 +13,48 @@ pub(super) const MISSING: u32 = u32::MAX;
 pub(super) const ZERO: u32 = u32::MAX - 1;
 
 /// what a draw needs from the rasterizer.
-pub(super) struct Draw<'a> {
-    pub(super) registers: &'a [u32],
-    pub(super) target: u32,
-    pub(super) format: ColorFormat,
-    pub(super) width: u32,
-    pub(super) height: u32,
+pub(crate) struct Draw<'a> {
+    pub(crate) registers: &'a [u32],
+    pub(crate) target: u32,
+    pub(crate) format: ColorFormat,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// the pixels the draw may touch, left, bottom, right and top in window
     /// coordinates, y up.
-    pub(super) scissor: [i32; 4],
+    pub(crate) scissor: [i32; 4],
     /// the depth and stencil buffer and its bytes per sample, when the draw
     /// uses one.
-    pub(super) depth: Option<(u32, u32)>,
-    pub(super) depth_map: DepthMap,
-    pub(super) geometry: Geometry<'a>,
-    pub(super) textures: &'a [Option<BoundTexture>; 3],
-    pub(super) lighting: Option<&'a Lighting>,
-    pub(super) tables: &'a Tables,
+    pub(crate) depth: Option<(u32, u32)>,
+    pub(crate) depth_map: DepthMap,
+    pub(crate) geometry: Geometry<'a>,
+    pub(crate) textures: &'a [Option<BoundTexture>; 3],
+    pub(crate) lighting: Option<&'a Lighting>,
+    pub(crate) tables: &'a Tables,
     /// whether the procedural texture is on, and its tables.
-    pub(super) proctex: bool,
-    pub(super) proctex_tables: &'a proctex::Tables,
+    pub(crate) proctex: bool,
+    pub(crate) proctex_tables: &'a proctex::Tables,
     /// whether the fog is on, and its table.
-    pub(super) fog: bool,
-    pub(super) fog_table: &'a crate::fog::Table,
+    pub(crate) fog: bool,
+    pub(crate) fog_table: &'a crate::fog::Table,
     /// what the fragment registers' changes number, the same as the last
     /// draw's while none changed.
-    pub(super) fragment_state: u64,
+    pub(crate) fragment_state: u64,
     /// shaded on the CPU only until its own program is built, which needs
     /// no program of its own for those few frames.
-    pub(super) stand_in: bool,
+    pub(crate) stand_in: bool,
     /// into a picture a screen shows, drawn again every frame: left out while
     /// its program builds rather than drawn with the generic one, which a
     /// handheld's GPU runs too slowly.
-    pub(super) skippable: bool,
+    pub(crate) skippable: bool,
     /// a quad or two, a menu's panel, a fade or a piece of the HUD: waits
     /// for its program rather than go missing or stand in, as Azahar has its
     /// draws of 6 vertices or fewer wait. Its programs are small and quick.
-    pub(super) small: bool,
+    pub(crate) small: bool,
 }
 
 /// the triangles of a draw.
 #[derive(Clone, Copy)]
-pub(super) enum Geometry<'a> {
+pub(crate) enum Geometry<'a> {
     /// shaded, clipped and culled on the CPU.
     Triangles(&'a [[Screen; 3]]),
     /// for the GPU to shade.
@@ -62,7 +62,7 @@ pub(super) enum Geometry<'a> {
 }
 
 /// vertices the GPU runs the vertex shader over.
-pub(super) struct Shading<'a> {
+pub(crate) struct Shading<'a> {
     pub(super) unit: &'a ShaderUnit,
     /// each vertex's input registers.
     pub(super) inputs: &'a [[Vec4; INPUT_REGISTERS]],

@@ -4,7 +4,7 @@
 
 use super::*;
 
-pub(super) const FRAGMENT_SOURCE: &str = include_str!("../../../shaders/raster.frag");
+pub(crate) const FRAGMENT_SOURCE: &str = include_str!("../../../shaders/raster.frag");
 
 /// the alpha test's compare as raster.frag has it, and as Adreno's compiler
 /// takes it: it fails to link the switch where it folds to a constant
@@ -32,7 +32,7 @@ pub(super) const ADRENO_COMPARE: &str = "    if (function < 2u) {
     return value > reference || (function == 7u && value == reference);";
 pub(super) static ADRENO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub(super) const VERTEX_SOURCE: &str = r#"#version 310 es
+pub(crate) const VERTEX_SOURCE: &str = r#"#version 310 es
 layout(location = 0) in vec4 position;
 layout(location = 1) in vec4 color;
 layout(location = 2) in vec4 texcoords01;
@@ -377,7 +377,7 @@ pub(super) fn key_registers() -> impl Iterator<Item = usize> {
 /// from its registers, the units enabled, those with their alpha apart and
 /// those reading a drawing in place, how its depth goes, and its lighting
 /// as the uniform block packs it.
-pub(super) fn fragment_constants(r: &[u32], enabled: u32, split: u32, sources: [bool; 3], depth_flags: u32, writes_depth: bool, lighting: Option<&[u32]>) -> ([u32; FRAGMENT_CONSTANTS], Vec<u32>) {
+pub(crate) fn fragment_constants(r: &[u32], enabled: u32, split: u32, sources: [bool; 3], depth_flags: u32, writes_depth: bool, lighting: Option<&[u32]>) -> ([u32; FRAGMENT_CONSTANTS], Vec<u32>) {
     let mut constants = [0u32; FRAGMENT_CONSTANTS];
     for (i, base) in STAGE_REGISTERS.into_iter().enumerate() {
         constants[i] = r[base] & 0x0FFF_0FFF;
@@ -401,7 +401,7 @@ pub(super) fn fragment_constants(r: &[u32], enabled: u32, split: u32, sources: [
     (constants, lighting.map_or_else(Vec::new, lighting_shape))
 }
 
-pub(super) fn generic_constants(constants: &[u32; FRAGMENT_CONSTANTS]) -> [u32; FRAGMENT_CONSTANTS] {
+pub(crate) fn generic_constants(constants: &[u32; FRAGMENT_CONSTANTS]) -> [u32; FRAGMENT_CONSTANTS] {
     let mut generic = [0u32; FRAGMENT_CONSTANTS];
     generic[25] = constants[25] & 0x400;
     generic[26] = constants[26];
@@ -657,7 +657,7 @@ pub(super) fn combiner_source(constants: &[u32; FRAGMENT_CONSTANTS]) -> String {
     out
 }
 
-pub(super) fn fragment_source(constants: &[u32; FRAGMENT_CONSTANTS], writes_depth: bool, lighting: &[u32]) -> String {
+pub(crate) fn fragment_source(constants: &[u32; FRAGMENT_CONSTANTS], writes_depth: bool, lighting: &[u32]) -> String {
     // the generic program stands in while a draw's own compiles, and with
     // every switch live it is the worst case a driver is asked for:
     // PowerVR's UniFlex kept the Redmi 9's 3D black rather than compile it.
@@ -842,3 +842,4 @@ void main() {
     color = vec4(texture(canvas, uv).rgb, 1.0);
 }
 "#;
+

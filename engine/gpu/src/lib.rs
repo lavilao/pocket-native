@@ -991,8 +991,15 @@ impl Gpu {
         self.resources.textures.begin_list();
         self.run_command_list(memory, renderer, paddr, size);
         #[cfg(feature = "gles")]
-        if let Some(hardware) = self.resources.hardware.as_ref() {
+        if let Some(hardware) = self.resources.hardware.as_mut() {
             hardware.flush_draws();
+            // a renderer that keeps what it drew only on its own device has
+            // it brought back here, everything else reading memory
+            if hardware.needs_readback() {
+                if let Err(error) = hardware.flush(memory) {
+                    log::error!("the GPU could not bring its drawings back, {error}");
+                }
+            }
         }
         self.busy += start.elapsed();
     }
@@ -1004,10 +1011,18 @@ impl Gpu {
     /// one, the screens are shown straight from the images drawn.
     #[cfg(feature = "gles")]
     pub fn enable_hardware_renderer(&mut self, scale: f32) -> Result<String, String> {
-        let mut hardware = raster::gles::Gles::new()?;
+        let mut hardware = raster::Hardware::new()?;
         let scale = hardware.set_scale(scale);
         let shaded = if hardware.shades() { "" } else { ", vertices shaded on the CPU," };
         let name = format!("{} at {scale}x{shaded}", hardware.name());
+        // a renderer that cannot show the screens, the Vulkan one, leaves
+        // that to the panel's, which needs making on its own
+        if !hardware.presents() && self.panel.is_none() {
+            self.panel = raster::gles::Gles::new().ok();
+            if self.panel.is_none() {
+                log::warn!("the panel's OpenGL ES renderer did not start, the screens stay as the software path leaves them");
+            }
+        }
         self.resources.hardware = Some(hardware);
         Ok(name)
     }
@@ -1039,8 +1054,21 @@ impl Gpu {
     /// between its last two shown first when interpolating.
     pub fn present_panel(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], cursor: Option<(i32, i32)>, overlays: Vec<std::sync::Arc<Overlay>>, smooth: bool, interpolate: bool, frames: u32) {
         #[cfg(feature = "gles")]
-        if let Some(hardware) = self.resources.hardware.as_mut().or(self.panel.as_mut()) {
-            hardware.present(shown, cursor, overlays, smooth, interpolate, frames);
+        {
+            // the panel's own renderer shows the screens when there is one,
+            // a Vulkan renderer drawing them leaving that to it
+            let shows_here = self.resources.hardware.as_ref().is_some_and(|hardware| hardware.presents());
+            if self.panel.is_none() && self.resources.hardware.is_some() && !shows_here {
+                self.panel = raster::gles::Gles::new().ok();
+            }
+            match self.panel.as_mut() {
+                Some(panel) => panel.present(shown, cursor, overlays, smooth, interpolate, frames),
+                None => {
+                    if let Some(hardware) = self.resources.hardware.as_mut() {
+                        hardware.present(shown, cursor, overlays, smooth, interpolate, frames);
+                    }
+                }
+            }
         }
         #[cfg(not(feature = "gles"))]
         let _ = (shown, cursor, overlays, smooth, interpolate, frames);
@@ -1049,8 +1077,13 @@ impl Gpu {
     /// lets the host GPU's threads finish, for the process to end.
     pub fn stop_hardware(&mut self) {
         #[cfg(feature = "gles")]
-        if let Some(hardware) = self.resources.hardware.as_mut().or(self.panel.as_mut()) {
-            hardware.stop();
+        {
+            if let Some(hardware) = self.resources.hardware.as_mut() {
+                hardware.stop();
+            }
+            if let Some(panel) = self.panel.as_mut() {
+                panel.stop();
+            }
         }
     }
 

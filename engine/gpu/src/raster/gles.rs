@@ -30,7 +30,7 @@ mod between;
 mod display;
 mod prepare;
 mod programs;
-mod sources;
+pub(crate) mod sources;
 
 use display::*;
 use prepare::Precache;
