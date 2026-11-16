@@ -210,6 +210,11 @@ pub fn run(mut args: Vec<String>) {
     if let Some(rotate) = rotate {
         std::env::set_var("ZAKURO_PANEL_ROTATE", rotate);
     }
+    // which API the GPU draws with, before the renderer starts, the setting
+    // unless ZAKURO_BACKEND names one for this run
+    if std::env::var_os("ZAKURO_BACKEND").is_none() {
+        std::env::set_var("ZAKURO_BACKEND", settings.backend.switch());
+    }
     let config = Config {
         recompiled: std::env::var("ZAKURO_RECOMPILED").ok().filter(|_| advanced.recompiled).map(Into::into),
         hardware_renderer: true,

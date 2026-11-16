@@ -119,6 +119,11 @@ struct TargetKey {
     depth: Option<u8>,
 }
 
+/// whether a buffer at a target's address, its whole extent, touches a range.
+fn overlaps(key: &TargetKey, addr: u32, len: u32) -> bool {
+    key.addr < addr.saturating_add(len) && addr < key.addr.saturating_add(key.width * key.height * 4)
+}
+
 struct Target {
     id: u64,
     image: vk::Image,
@@ -391,22 +396,20 @@ impl Vulkan {
 
     pub fn flush_draws(&mut self) {}
 
-    /// whether guest memory only holds what was drawn once the command list
-    /// ends, as it does not here: the drawings come back to memory then, so
-    /// the rest of the emulator, and the panel, read what the GPU drew.
-    pub fn needs_readback(&self) -> bool {
-        true
+    /// guest memory was written by something else over a range: a buffer
+    /// that overlaps it comes up from memory again before its next draw.
+    pub fn overwritten(&mut self, addr: u32, len: u32) {
+        for (key, target) in self.targets.iter_mut() {
+            if overlaps(key, addr, len) {
+                target.loaded = false;
+            }
+        }
     }
 
     /// a fill wrote guest memory itself, so what the renderer draws from a
     /// buffer it held has to come up again before the next draw.
     pub fn filled(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
-        let len = bytes.len() as u32;
-        for (key, target) in self.targets.iter_mut() {
-            if key.addr < addr.saturating_add(len) && addr < key.addr.saturating_add(key.width * key.height * 4) {
-                target.loaded = false;
-            }
-        }
+        self.overwritten(addr, bytes.len() as u32);
         Ok(())
     }
 
@@ -414,22 +417,20 @@ impl Vulkan {
         Ok(false)
     }
 
-    pub fn before_fill<M: GpuMemory>(&mut self, memory: &mut M, _addr: u32, _len: u32, _width: u32) -> Result<(), String> {
-        self.flush(memory)
+    pub fn before_fill<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32, _width: u32) -> Result<(), String> {
+        self.flush_overlapping(memory, addr, len)
     }
 
-    pub fn before_overwrite<M: GpuMemory>(&mut self, memory: &mut M, _addr: u32, _len: u32) -> Result<(), String> {
-        self.flush(memory)
+    pub fn before_overwrite<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
+        self.flush_overlapping(memory, addr, len)
     }
 
-    pub fn sync<M: GpuMemory>(&mut self, memory: &mut M, _addr: u32, _len: u32) -> Result<(), String> {
-        self.flush(memory)
+    pub fn sync<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
+        self.flush_overlapping(memory, addr, len)
     }
 
-    pub fn prepare_read<M: GpuMemory>(&mut self, memory: &mut M, _addr: u32, _len: u32, _texture: Option<&super::DrawnTexture>) -> Result<(), String> {
-        // SAFETY: nothing else touches the buffers while they come down
-        let _ = memory;
-        self.flush(memory)
+    pub fn prepare_read<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32, _texture: Option<&super::DrawnTexture>) -> Result<(), String> {
+        self.flush_overlapping(memory, addr, len)
     }
 
     /// the displays' transfers run in software, guest memory being right
@@ -709,6 +710,20 @@ impl Vulkan {
     pub fn flush<M: GpuMemory>(&mut self, memory: &mut M) -> Result<(), String> {
         self.submit()?;
         let dirty: Vec<TargetKey> = self.targets.iter().filter(|(_, target)| target.dirty).map(|(key, _)| *key).collect();
+        for key in dirty {
+            self.download(memory, key)?;
+            if let Some(target) = self.targets.get_mut(&key) {
+                target.dirty = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// submits the draws recorded and brings back the buffers a range
+    /// touches, the others staying on the device until something reads one.
+    fn flush_overlapping<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
+        self.submit()?;
+        let dirty: Vec<TargetKey> = self.targets.iter().filter(|(key, target)| target.dirty && overlaps(key, addr, len)).map(|(key, _)| *key).collect();
         for key in dirty {
             self.download(memory, key)?;
             if let Some(target) = self.targets.get_mut(&key) {

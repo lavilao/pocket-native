@@ -993,13 +993,6 @@ impl Gpu {
         #[cfg(feature = "gles")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             hardware.flush_draws();
-            // a renderer that keeps what it drew only on its own device has
-            // it brought back here, everything else reading memory
-            if hardware.needs_readback() {
-                if let Err(error) = hardware.flush(memory) {
-                    log::error!("the GPU could not bring its drawings back, {error}");
-                }
-            }
         }
         self.busy += start.elapsed();
     }

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use crate::font::{rgba, Canvas};
 use crate::input::{A, B, DOWN, LEFT, MAPPED, RIGHT, UP};
 use crate::profile::Profile;
-use crate::settings::{Advanced, Aspect, Buttons, Cursor, Dpad, GameSettings, Key, Layout, Power, RightStick, Rotation, Settings, Speed, Stick, Stretch};
+use crate::settings::{Advanced, Aspect, Backend, Buttons, Cursor, Dpad, GameSettings, Key, Layout, Power, RightStick, Rotation, Settings, Speed, Stick, Stretch};
 
 const PANEL: [u8; 3] = [13, 20, 32];
 const EDGE: [u8; 3] = [40, 110, 210];
@@ -26,6 +26,7 @@ enum Field {
     Layout,
     Aspect,
     Resolution,
+    Backend,
     Smooth,
     Stretch,
     Interpolate,
@@ -184,7 +185,7 @@ fn sections(page: Page, profile: &Profile) -> Vec<(&'static str, Vec<Field>)> {
     let only = |fields: Vec<Field>| fields.into_iter().filter(|&field| useful(field)).collect();
     match page {
         Page::Main => vec![
-            ("Display", only(vec![Field::Layout, Field::Aspect, Field::Resolution, Field::Smooth, Field::Stretch, Field::Interpolate, Field::ShowFps, Field::ShowClock, Field::ShowBuilding, Field::ShowSaving, Field::Rotation])),
+            ("Display", only(vec![Field::Layout, Field::Aspect, Field::Resolution, Field::Backend, Field::Smooth, Field::Stretch, Field::Interpolate, Field::ShowFps, Field::ShowClock, Field::ShowBuilding, Field::ShowSaving, Field::Rotation])),
             ("Performance", only(vec![Field::FrameCap, Field::Power])),
             ("This game", (0..profile.options.len()).map(Field::Option).collect()),
             ("Controls", only(vec![Field::TouchSpeed, Field::Cursor, Field::Buttons, Field::LeftStick, Field::Dpad, Field::RightStick, Field::ReverseTiltX, Field::ReverseTiltY, Field::TouchControls, Field::EditControls, Field::Mapping])),
@@ -232,6 +233,15 @@ fn label(field: Field, settings: &Settings, game: &GameSettings, profile: &Profi
             .into(),
         ),
         Field::Resolution => ("Resolution", if settings.resolution == 1.0 { "Native".into() } else { format!("{}x", settings.resolution) }),
+        Field::Backend => (
+            "Renderer API",
+            match settings.backend {
+                Backend::Gles => "OpenGL ES",
+                Backend::Vulkan => "Vulkan",
+                Backend::Auto => "Auto",
+            }
+            .into(),
+        ),
         Field::Smooth => ("Smooth scaling", if settings.smooth { "On" } else { "Off" }.into()),
         Field::Stretch => (
             "Fill the display",
@@ -321,6 +331,7 @@ fn change(field: Field, by: isize, settings: &mut Settings, game: &mut GameSetti
         }
         Field::Aspect => settings.aspect = step(&Aspect::ALL, settings.aspect, by),
         Field::Resolution => settings.resolution = step(&RESOLUTIONS, settings.resolution, by),
+        Field::Backend => settings.backend = step(&[Backend::Gles, Backend::Vulkan, Backend::Auto], settings.backend, by),
         Field::Smooth => settings.smooth = !settings.smooth,
         Field::Stretch => {
             let at = Stretch::ALL.iter().position(|&stretch| stretch == settings.stretched).unwrap_or(0) as isize;
@@ -382,6 +393,7 @@ fn help(field: Field, profile: &Profile) -> &str {
         Field::Layout => "Where the screens go. A tap of L2 swaps them, FN or L3 with R1 switch to one big screen.",
         Field::Aspect => "The screens' shape: as on the 3DS, by whole pixels, 4:3, 16:10, 16:9, stretched, or the top one's sides cropped.",
         Field::Resolution => "How sharp the 3D is drawn, times the 3DS's own. Higher takes more GPU. Restart the game for it.",
+        Field::Backend => "OpenGL ES or Vulkan, which some drivers take faster. Applies when the game starts again.",
         Field::Smooth => "Smooths the picture as it is scaled up. Off is sharper, with uneven pixels.",
         Field::Stretch => "With a screen on each display, the screens stretched over theirs: no bars, but out of shape.",
         Field::Interpolate => "Fills in pictures halfway between a game's, up to 30 or 60 a second. 30 costs half as much GPU time.",

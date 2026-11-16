@@ -66,7 +66,8 @@ import org.json.JSONObject;
  * Each game is a folder named after its title id in games/, in the app's
  * folder on a removable card when there is one, else on shared storage:
  * game.3ds, sysdata/ and data/ (saves, its log), with name.txt and icon.png
- * from the game's own banner. Its recompiled code goes in code/ in the app's
+ * from the game's own banner, and the .cia files of its update and DLC,
+ * which holding the game's row adds. Its recompiled code goes in code/ in the app's
  * own storage, read only, where Android lets an app load code from.
  */
 public final class Launcher extends Activity {
@@ -74,6 +75,7 @@ public final class Launcher extends Activity {
     private static final int BLUE = 0xFF2F6FE0;
     private static final int ADD_FOLDER = 1;
     private static final int ADD_PACK = 2;
+    private static final int ADD_CIA = 3;
     /** a shortcut's intent: the game in the "game" extra, played at once. */
     private static final String PLAY_GAME = "io.github.pocketnative.PLAY";
     private static final String RELEASES = "https://api.github.com/repos/whovian64/pocket-native/releases/latest";
@@ -85,6 +87,8 @@ public final class Launcher extends Activity {
     private View gamesPage;
     private ScrollView devicePage;
     private Button deviceButton;
+    /** the game folder an update or DLC picked next goes in. */
+    private File ciaFolder;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -129,7 +133,7 @@ public final class Launcher extends Activity {
         view.setAdapter(list);
         view.setOnItemClickListener((parent, row, position, id) -> play(games.get(position)));
         view.setOnItemLongClickListener((parent, row, position, id) -> {
-            pin(games.get(position));
+            gameMenu(games.get(position));
             return true;
         });
         page.addView(view, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
@@ -151,6 +155,28 @@ public final class Launcher extends Activity {
                 Toast.makeText(this, "That game is not here any more", Toast.LENGTH_LONG).show();
             }
         }
+    }
+
+    /**
+     * what a held game offers: adding an update or DLC beside it, or its
+     * shortcut on the home screen.
+     */
+    private void gameMenu(File folder) {
+        new AlertDialog.Builder(this)
+                .setTitle(name(folder))
+                .setItems(new String[] {"Add an update or DLC (.cia)", "Pin to home screen"}, (dialog, which) -> {
+                    if (which == 1) {
+                        pin(folder);
+                        return;
+                    }
+                    ciaFolder = folder;
+                    Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    pick.addCategory(Intent.CATEGORY_OPENABLE);
+                    pick.setType("*/*");
+                    pick.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                    startActivityForResult(pick, ADD_CIA);
+                })
+                .show();
     }
 
     /** a game's shortcut, its icon and name, for the home screen. */
@@ -432,15 +458,82 @@ public final class Launcher extends Activity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (result != RESULT_OK || data == null || data.getData() == null) {
+        if (result != RESULT_OK || data == null) {
+            return;
+        }
+        if (request == ADD_CIA) {
+            addCias(data);
             return;
         }
         Uri uri = data.getData();
+        if (uri == null) {
+            return;
+        }
         if (request == ADD_FOLDER) {
             inBackground("Adding", progress -> withCleanUp(() -> added(importFolder(uri, progress))));
         } else if (request == ADD_PACK) {
             inBackground("Adding", progress -> withCleanUp(() -> added(importPack(uri, progress))));
         }
+    }
+
+    /**
+     * the updates and DLC picked copied into the game's folder, where the
+     * loader takes them up by title ID, the newest update among them.
+     */
+    private void addCias(Intent data) {
+        File folder = ciaFolder;
+        ciaFolder = null;
+        if (folder == null) {
+            return;
+        }
+        List<Uri> picked = new ArrayList<>();
+        if (data.getClipData() != null) {
+            for (int i = 0; i < data.getClipData().getItemCount(); i++) {
+                picked.add(data.getClipData().getItemAt(i).getUri());
+            }
+        } else if (data.getData() != null) {
+            picked.add(data.getData());
+        }
+        inBackground("Adding", progress -> {
+            int added = 0;
+            String last = null;
+            for (Uri uri : picked) {
+                String name = displayName(uri);
+                if (!name.toLowerCase().endsWith(".cia")) {
+                    // an update or DLC is a .cia, anything else is left out
+                    continue;
+                }
+                copy(open(uri), new File(folder, name), name, -1, progress);
+                last = name;
+                added++;
+            }
+            if (added == 0) {
+                return "Nothing added: an update or DLC is a .cia file";
+            }
+            return (added == 1 ? "Added " + last : "Added " + added + " files") + " beside the game, taken up when the game starts.";
+        });
+    }
+
+    /** the name a picked document has. */
+    private String displayName(Uri uri) {
+        try (Cursor cursor = getContentResolver().query(uri, new String[] {android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToNext() && cursor.getString(0) != null) {
+                return new File(cursor.getString(0)).getName();
+            }
+        } catch (RuntimeException ignored) {
+            // a provider that will not say, the last part of the uri stands in
+        }
+        String last = uri.getLastPathSegment();
+        return last == null ? "update.cia" : new File(last.replace(':', '/')).getName();
+    }
+
+    /** a picked document opened for reading. */
+    private InputStream open(Uri uri) throws IOException {
+        InputStream in = getContentResolver().openInputStream(uri);
+        if (in == null) {
+            throw new IOException("could not open it");
+        }
+        return in;
     }
 
     private interface Progress {
@@ -879,6 +972,11 @@ public final class Launcher extends Activity {
         page.addView(choice("Resolution", "How sharp the 3D is drawn, times the 3DS's own. Higher takes more of the GPU.",
                 resolutions, Math.max(0, Math.min(resolution, resolutions.length - 1)), true,
                 which -> putSetting("resolution", String.valueOf(1.0 + which * 0.25))));
+        String[] backends = {"Gles", "Vulkan", "Auto"};
+        page.addView(choice("Renderer", "The graphics API the 3D is drawn with. OpenGL ES is the older one every device has; Vulkan draws through a newer driver, faster on some devices and slower or wrong on others. Auto is Vulkan where there is one.",
+                new String[] {"OpenGL ES", "Vulkan", "Auto"},
+                indexOf(backends, setting("backend", "\"Gles\"").replace("\"", "").trim()), true,
+                which -> putSetting("backend", "\"" + backends[which] + "\"")));
         page.addView(choice("Smooth scaling", "Blends the pixels as the screens are scaled to fit. Off is sharper, with uneven pixels.",
                 new String[] {"On", "Off"}, "false".equals(setting("smooth", "true")) ? 1 : 0, true,
                 which -> putSetting("smooth", which == 0 ? "true" : "false")));

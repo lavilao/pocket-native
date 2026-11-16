@@ -28,17 +28,21 @@ pub(crate) enum Hardware {
 
 #[cfg(feature = "gles")]
 impl Hardware {
-    /// the renderer to draw with, Vulkan first unless ZAKURO_BACKEND=gles
-    /// asks for OpenGL ES, falling back to OpenGL ES when Vulkan does not
-    /// start.
+    /// the renderer to draw with, Vulkan first unless the settings or
+    /// ZAKURO_BACKEND ask for OpenGL ES, falling back to OpenGL ES when
+    /// Vulkan does not start. ZAKURO_BACKEND is gles, vulkan, or auto for
+    /// Vulkan where there is one.
     pub fn new() -> Result<Hardware, String> {
         #[cfg(feature = "vulkan")]
         {
-            static PICKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let force_gles = *PICKED.get_or_init(|| std::env::var("ZAKURO_BACKEND").is_ok_and(|backend| backend.eq_ignore_ascii_case("gles")));
+            static PICKED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            let backend = PICKED.get_or_init(|| std::env::var("ZAKURO_BACKEND").unwrap_or_default().to_ascii_lowercase());
+            let force_gles = backend == "gles";
+            let force_vulkan = backend == "vulkan";
             if !force_gles {
                 match vulkan::Vulkan::new() {
                     Ok(vulkan) => return Ok(Hardware::Vulkan(vulkan)),
+                    Err(error) if force_vulkan => return Err(format!("the Vulkan renderer was asked for and did not start, {error}")),
                     Err(error) => log::warn!("the Vulkan renderer did not start, {error}, drawing with OpenGL ES"),
                 }
             }
@@ -130,13 +134,13 @@ impl Hardware {
         }
     }
 
-    /// whether the drawings have to come back to guest memory when a
-    /// command list ends, as the Vulkan renderer's do.
-    pub fn needs_readback(&self) -> bool {
+    /// guest memory was written by something else over a range, so a buffer
+    /// the renderer holds there comes up from it again before the next draw.
+    pub fn overwritten(&mut self, addr: u32, len: u32) {
         match self {
-            Hardware::Gles(_) => false,
+            Hardware::Gles(_) => {}
             #[cfg(feature = "vulkan")]
-            Hardware::Vulkan(hardware) => hardware.needs_readback(),
+            Hardware::Vulkan(hardware) => hardware.overwritten(addr, len),
         }
     }
 
@@ -2945,6 +2949,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         if let Err(error) = hardware.flush(memory) {
             log::error!("the GPU could not write back its buffers, {error}");
         }
+        // what comes next is drawn into guest memory here, so the buffer the
+        // renderer holds comes up from it again before its next draw
+        hardware.overwritten(target.addr, target.buffer_width * target.buffer_height * 4);
         // and on textures read from it, which the ones the GPU was to copy
         // were not, and decoded rather than packed for the GPU
         if drawn.iter().any(Option::is_some) || state.textures.iter().flatten().any(|texture| texture.packed.is_some()) {

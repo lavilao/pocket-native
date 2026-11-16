@@ -146,6 +146,9 @@ pub struct Settings {
     /// how many times the console's resolution the GPU draws at, in
     /// quarters from 1 to 3.5, from the next start.
     pub resolution: f32,
+    /// which of the host's graphics APIs the 3D is drawn with, from the
+    /// next start.
+    pub backend: Backend,
     /// pictures a second the panel is filled up to with ones halfway
     /// between each two of the top screen's, 30 or 60, 0 for none.
     pub interpolate_to: u32,
@@ -190,6 +193,7 @@ impl Default for Settings {
             stretched: Stretch::Off,
             aspect: Aspect::Original,
             resolution: 1.0,
+            backend: Backend::Gles,
             interpolate_to: 0,
             show_fps: false,
             show_clock: true,
@@ -209,6 +213,42 @@ impl Default for Settings {
             touch_controls: cfg!(target_os = "android"),
             name: "Zakuro".into(),
         }
+    }
+}
+
+/// which of the host's graphics APIs the 3D is drawn with. OpenGL ES is the
+/// older one every device has; Vulkan draws through a newer driver, on some
+/// devices faster, on others slower or wrong. Auto is Vulkan where there is
+/// a Vulkan device and OpenGL ES otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Backend {
+    #[serde(rename = "OpenGL ES", alias = "Gles")]
+    Gles,
+    #[serde(rename = "Vulkan")]
+    Vulkan,
+    #[serde(rename = "Auto")]
+    Auto,
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Backend::Gles
+    }
+}
+
+impl Backend {
+    /// what ZAKURO_BACKEND says for it.
+    pub fn switch(self) -> &'static str {
+        match self {
+            Backend::Gles => "gles",
+            Backend::Vulkan => "vulkan",
+            Backend::Auto => "auto",
+        }
+    }
+
+    /// the one named, as the setting saves it.
+    pub fn named(name: &str) -> Option<Backend> {
+        [Backend::Gles, Backend::Vulkan, Backend::Auto].into_iter().find(|backend| format!("{backend:?}").eq_ignore_ascii_case(name) || backend.switch().eq_ignore_ascii_case(name))
     }
 }
 
