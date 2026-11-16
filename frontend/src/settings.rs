@@ -152,6 +152,10 @@ pub struct Settings {
     pub show_fps: bool,
     /// the battery and the time under the screens.
     pub show_clock: bool,
+    /// the box while new shaders build.
+    pub show_building: bool,
+    /// the word in the top right corner while the game saves.
+    pub show_saving: bool,
     /// the picture turned onto a sideways panel, as ZAKURO_PANEL_ROTATE
     /// does, which Auto leaves to.
     pub rotation: Rotation,
@@ -173,6 +177,8 @@ pub struct Settings {
     /// buttons and sticks drawn over the screens, for a touch screen with
     /// no gamepad.
     pub touch_controls: bool,
+    /// the owner's name games are told.
+    pub name: String,
 }
 
 impl Default for Settings {
@@ -187,6 +193,8 @@ impl Default for Settings {
             interpolate_to: 0,
             show_fps: false,
             show_clock: true,
+            show_building: true,
+            show_saving: true,
             rotation: Rotation::Auto,
             frame_cap: 30,
             power: Power::Performance,
@@ -199,6 +207,7 @@ impl Default for Settings {
             reverse_tilt_x: false,
             reverse_tilt_y: false,
             touch_controls: cfg!(target_os = "android"),
+            name: "Zakuro".into(),
         }
     }
 }
@@ -214,11 +223,31 @@ pub struct GameSettings {
     pub region: u8,
     pub options: BTreeMap<String, bool>,
     pub advanced: Option<Advanced>,
+    /// the screens' layout and swap the game was last left in.
+    pub layout: Option<Layout>,
+    pub swapped: Option<bool>,
+    /// the game's own buttons: a 3DS button, by name, to the handheld's that
+    /// presses it, the others as the controls set them.
+    pub buttons: BTreeMap<String, Key>,
+}
+
+/// a handheld button in a game's mapping, or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Key {
+    A,
+    B,
+    X,
+    Y,
+    L,
+    R,
+    Select,
+    Start,
+    Off,
 }
 
 impl Default for GameSettings {
     fn default() -> Self {
-        GameSettings { language: LANGUAGE_ENGLISH, region: REGION_USA, options: BTreeMap::new(), advanced: None }
+        GameSettings { language: LANGUAGE_ENGLISH, region: REGION_USA, options: BTreeMap::new(), advanced: None, layout: None, swapped: None, buttons: BTreeMap::new() }
     }
 }
 

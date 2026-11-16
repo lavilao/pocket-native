@@ -271,7 +271,7 @@ fn open_host_archive(system: &System, archive_id: u32, path: &[u8]) -> Result<Ho
         if !archive.exists() {
             make_play_coins(&archive)?;
         }
-        make_mii_database(&archive)?;
+        make_mii_database(&archive, &system.config.user_name)?;
     }
     if archive.exists() {
         return Ok(archive);
@@ -288,12 +288,12 @@ const PLAY_COINS: u32 = 0xF000_000B;
 
 /// the Mii database with the console's Mii, when there is none: Mario Kart 7
 /// stops at "There are currently no Mii characters" without one.
-fn make_mii_database(archive: &HostArchive) -> Result<(), ResultCode> {
+fn make_mii_database(archive: &HostArchive, name: &str) -> Result<(), ResultCode> {
     let file = archive.resolve("CFL_DB.dat")?;
     if file.exists() {
         return Ok(());
     }
-    std::fs::write(file, super::mii_selector::database()).map_err(|_| errors::FS_NOT_FORMATTED)
+    std::fs::write(file, super::mii_selector::database(name)).map_err(|_| errors::FS_NOT_FORMATTED)
 }
 
 /// makes the play coins' extra data the way a console that never walked
@@ -638,8 +638,10 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
         }
 
         // CreateExtSaveData(media type, id low, id high, unknown,
-        //   directories, files, size limit u64, icon size, <icon>)
-        0x0851 => {
+        //   directories, files, size limit u64, icon size, <icon>), and
+        //   the older one MH3U calls, (media type, id low, id high, icon
+        //   size, directories, files, <icon>)
+        0x0830 | 0x0851 => {
             let path: Vec<u8> = (1..4)
                 .flat_map(|i| buffer.get(&mut system.memory, i).to_le_bytes())
                 .collect();
@@ -649,8 +651,9 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
                 files: buffer.get(&mut system.memory, 6),
                 duplicate_data: false,
             };
-            let icon_descriptor = buffer.get(&mut system.memory, 10);
-            let icon_ptr = buffer.get(&mut system.memory, 11);
+            let icon = if command == 0x0830 { 7 } else { 10 };
+            let icon_descriptor = buffer.get(&mut system.memory, icon);
+            let icon_ptr = buffer.get(&mut system.memory, icon + 1);
             let result = match host_archive_for(system, ARCHIVE_EXTDATA, &path) {
                 // creating extra data that is already there leaves its
                 // contents alone.
@@ -666,11 +669,13 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) -> 
             true
         }
 
-        // DeleteExtSaveData(media type, id low, id high, unknown)
-        0x0852 => {
-            let path: Vec<u8> = (1..4)
+        // DeleteExtSaveData(media type, id low, id high, unknown), and the
+        //   older one, (media type, id low)
+        0x0835 | 0x0852 => {
+            let mut path: Vec<u8> = (1..if command == 0x0835 { 3 } else { 4 })
                 .flat_map(|i| buffer.get(&mut system.memory, i).to_le_bytes())
                 .collect();
+            path.resize(12, 0);
             let result = host_archive_for(system, ARCHIVE_EXTDATA, &path)
                 .ok_or(errors::FS_INVALID_PATH)
                 .and_then(|archive| archive.delete());
@@ -1255,5 +1260,32 @@ mod tests {
         assert_eq!(buffer.header(&mut system.memory), Header::new(0x086E, 1, 0));
         assert_eq!(buffer.get(&mut system.memory, 1), 0);
         assert!(system.services.unimplemented.is_empty());
+    }
+
+    /// MH3U makes its extra data on the SD card with the older calls,
+    /// deleting it first, and asks for an SD card when they fail.
+    #[test]
+    fn older_extra_data_calls_make_and_delete_it() {
+        let (mut system, buffer) = system_with_thread();
+        let dir = std::env::temp_dir().join(format!("pn-extdata-{}", std::process::id()));
+        system.services.fs.user_dir = dir.clone();
+        let call = |system: &mut System, words: &[u32]| {
+            for (index, &word) in (0..).zip(words) {
+                buffer.set(&mut system.memory, index, word);
+            }
+            handle_request(system, Target::service("fs:USER".into(), 0));
+            buffer.get(&mut system.memory, 1)
+        };
+        let archive = HostArchive::ext_data(&dir, 0xAE4, false);
+        buffer.set(&mut system.memory, 3, 0xDEAD);
+        call(&mut system, &[Header::new(0x0835, 2, 0).0, 1, 0xAE4]);
+        assert_eq!(call(&mut system, &[Header::new(0x0830, 6, 2).0, 1, 0xAE4, 0, 0x36C0, 0x40, 0x40, 0x36C0 << 4 | 0xA, 0x1000]), 0);
+        assert!(archive.exists());
+        assert_eq!(buffer.get(&mut system.memory, 3), 0x1000);
+        buffer.set(&mut system.memory, 3, 0xDEAD);
+        assert_eq!(call(&mut system, &[Header::new(0x0835, 2, 0).0, 1, 0xAE4]), 0);
+        assert!(!archive.exists());
+        assert!(system.services.unimplemented.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

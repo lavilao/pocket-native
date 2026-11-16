@@ -5,6 +5,7 @@
 //! its own, an svc, an unknown target, a full budget, returns all the way
 //! out to the host, which picks up again from r15.
 
+pub mod a64;
 mod arm;
 mod thumb;
 mod vfp;
@@ -90,10 +91,16 @@ fn jump(out: &mut String, scope: &Scope, target: u32, thumb: bool) -> bool {
 /// instructions per source file, so the files compile in parallel.
 const FILE_SIZE: usize = 20_000;
 
+/// the most instructions a function becomes C with: Star Fox 64 3D's European
+/// release had discovery run one to about 400,000, two million lines no C
+/// compiler got through, where the biggest in the tested games is about 22,000.
+/// a bigger one is left to the interpreter.
+const MOST_INSTRUCTIONS: usize = 100_000;
+
 /// whether a function becomes C, which it does unless its entry turned
-/// out not to be code.
+/// out not to be code or it is too big to compile.
 pub fn recompiles(entry: u32, function: &Function) -> bool {
-    function.labels.contains(&entry)
+    function.labels.contains(&entry) && function.instructions.len() <= MOST_INSTRUCTIONS
 }
 
 /// an address as the host looks it up, bit 0 set for Thumb.
@@ -154,7 +161,18 @@ pub struct Unit<'a> {
 /// contents. the overrides take the place of the functions they replace,
 /// which overrides.h lets them still call.
 pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)> {
+    generate_with(units, overrides, std::env::var_os("RECOMP_A64").is_some_and(|value| value == "1"))
+}
+
+/// generate, with the executable's ARM functions also written as AArch64
+/// assembly where a64 is set, see a64.rs.
+pub fn generate_with(units: &[Unit], overrides: &[Override], a64: bool) -> Vec<(String, String)> {
     let mut files = vec![("recomp.h".to_owned(), HEADER.to_owned())];
+    let mut assembly: Vec<String> = Vec::new();
+    let mut assembled = None;
+    // the executable's translated functions, for calls through a register
+    // to find their way in
+    let mut inner: Vec<u32> = Vec::new();
     let mut sources: Vec<String> = Vec::new();
     let mut source = String::new();
     // the headers the file being written includes
@@ -168,6 +186,11 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
     for (index, unit) in units.iter().enumerate() {
         let prefix = if unit.module.is_some() { format!("m{index:03}_") } else { String::new() };
         let header = format!("{}functions.h", prefix);
+        for (entry, function) in &unit.analysis.functions {
+            if function.instructions.len() > MOST_INSTRUCTIONS && function.labels.contains(entry) {
+                eprintln!("the function at {entry:08X} has {} instructions, too many to compile: the interpreter runs it", function.instructions.len());
+            }
+        }
         let mut functions: BTreeMap<u32, &Function> =
             unit.analysis.functions.iter().filter(|&(&entry, f)| recompiles(entry, f)).map(|(&e, f)| (e, f)).collect();
         let containers = containers(&functions);
@@ -196,6 +219,44 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             original_headers.insert(header.clone());
         }
 
+        // each function's labels with those after what it interprets: written
+        // once to see what goes to the interpreter, the code can stop after
+        // any of those, and the host comes back in right after
+        let relative = unit.module.is_some();
+        let mut resumed: BTreeMap<u32, Function> = BTreeMap::new();
+        for (&entry, function) in &functions {
+            let interpreted = std::cell::RefCell::new(Vec::new());
+            let scope = Scope { labels: &function.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
+            write_function(&mut String::new(), unit.program, &scope, entry, function);
+            let mut resumable = (*function).clone();
+            for address in interpreted.take() {
+                let at = function.instructions.iter().position(|&a| a == address);
+                if let Some(&next) = at.and_then(|i| function.instructions.get(i + 1)) {
+                    resumable.labels.insert(next);
+                }
+            }
+            resumed.insert(entry, resumable);
+        }
+
+        // the executable's functions worth writing as assembly, which calls
+        // and their entries go to from then on
+        let translated: BTreeSet<u32> = if a64 {
+            functions
+                .keys()
+                .copied()
+                .filter(|&entry| names.get(&entry) == Some(&name(&prefix, entry, false)))
+                .filter(|entry| a64::worth(unit.program, *entry, &resumed[entry], &resumed[entry].labels, &names, &prefix))
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        for &entry in &translated {
+            names.insert(entry, a64::name(&prefix, entry));
+        }
+        if unit.module.is_none() {
+            inner.extend(&translated);
+        }
+
         let mut prototypes = String::new();
         if unit.module.is_some() {
             emit!(prototypes, "extern uint32_t {prefix}base;");
@@ -206,11 +267,14 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         for (&entry, function) in &functions {
             emit!(prototypes, "void {}(Context *ctx);", name(&prefix, entry, function.mode == Mode::Thumb));
         }
+        for &entry in &translated {
+            emit!(prototypes, "void {}(Context *ctx);", a64::name(&prefix, entry));
+        }
         files.push((header.clone(), prototypes));
 
         let include = format!("#include \"{header}\"\n\n");
-        // each function's labels with those after what it interprets
-        let mut resumed: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        let mut written = 0;
+        let mut starts: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
         for (&entry, function) in &functions {
             if source.is_empty() {
                 source.push_str("#include \"recomp.h\"\n#ifdef RECOMP_FASTMEM\n#undef RECOMP_VIEW\n#define RECOMP_VIEW(ctx) view\n#endif\n");
@@ -218,24 +282,35 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             if included.insert(index) {
                 source.push_str(&include);
             }
-            // written once to see what goes to the interpreter, the code
-            // can stop after any of those, and then again with a label
-            // after each, where the host comes back in
             let interpreted = std::cell::RefCell::new(Vec::new());
-            let relative = unit.module.is_some();
-            let scope = Scope { labels: &function.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
-            write_function(&mut String::new(), unit.program, &scope, entry, function);
-            let mut resumable = (*function).clone();
-            for address in interpreted.take() {
-                let at = function.instructions.iter().position(|&a| a == address);
-                if let Some(&next) = at.and_then(|i| function.instructions.get(i + 1)) {
-                    resumable.labels.insert(next);
-                }
-            }
+            let resumable = &resumed[&entry];
             let scope = Scope { labels: &resumable.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
-            write_function(&mut source, unit.program, &scope, entry, &resumable);
-            resumed.insert(entry, resumable.labels);
-            size += function.instructions.len();
+            let c_name = name(&prefix, entry, false);
+            let mut c = true;
+            if translated.contains(&entry) {
+                // a file for each unit: its local labels go by address
+                if assembly.last().is_none_or(|_| written >= FILE_SIZE) || assembled != Some(index) {
+                    assembly.push(a64::prelude(relative));
+                    assembled = Some(index);
+                    written = 0;
+                }
+                let mut text = String::new();
+                let (taken, needs_c) = a64::write(&mut text, unit.program, entry, resumable, &resumable.labels, &names, &c_name, &prefix);
+                let taken: BTreeSet<u32> = taken.into_iter().collect();
+                // every block taken, the C would only hand on what isn't
+                // its own: none of it, unless something calls it by name
+                if !needs_c && taken == resumable.labels && !names.values().any(|name| *name == c_name) && !replaced.iter().any(|item| item.address == entry) {
+                    text = text.replace(&format!("\tb {c_name}\n"), "\tb recomp_out\n");
+                    c = false;
+                }
+                assembly.last_mut().expect("a file to write into").push_str(&text);
+                starts.insert(entry, taken);
+                written += function.instructions.len();
+            }
+            if c {
+                write_function(&mut source, unit.program, &scope, entry, resumable);
+                size += function.instructions.len();
+            }
             if size >= FILE_SIZE {
                 sources.push(std::mem::take(&mut source));
                 included.clear();
@@ -248,10 +323,13 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         let mut entries: BTreeMap<u32, String> = BTreeMap::new();
         for (&entry, function) in &functions {
             let owner = name(&prefix, entry, function.mode == Mode::Thumb);
-            for &label in resumed.get(&entry).unwrap_or(&function.labels) {
-                let slot = entries.entry(key(label, function.mode)).or_insert_with(|| owner.clone());
+            // the host comes back into the assembly where it takes the block
+            let taken = starts.get(&entry);
+            for &label in resumed.get(&entry).map_or(&function.labels, |resumable| &resumable.labels) {
+                let here = if taken.is_some_and(|taken| taken.contains(&label)) { a64::name(&prefix, entry) } else { owner.clone() };
+                let slot = entries.entry(key(label, function.mode)).or_insert_with(|| here);
                 if label == entry {
-                    slot.clone_from(&owner);
+                    *slot = if translated.contains(&entry) { a64::name(&prefix, entry) } else { owner.clone() };
                 }
             }
         }
@@ -285,6 +363,33 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         sources.push(source);
     }
 
+    if a64 {
+        // what the assembly of a function the C isn't written for hands on
+        emit!(tables, "void recomp_out(Context *ctx) {{\n    CALL(recomp_call);\n}}\n");
+        // the translated function at an address of the executable, the way in
+        // for another, kept in the cache of the call that asked
+        for entry in &inner {
+            emit!(tables, "void b_{entry:08X}(void);");
+        }
+        emit!(tables, "static const struct {{ uint32_t address; void (*inner)(void); }} a64_inner[] = {{");
+        for entry in &inner {
+            emit!(tables, "    {{0x{entry:08X}u, b_{entry:08X}}},");
+        }
+        emit!(tables, "    {{0xFFFFFFFFu, 0}},\n}};");
+        emit!(tables, "typedef struct {{ uint32_t address, pad; void (*inner)(void); }} A64Cache;");
+        emit!(tables, "void recomp_a64_find(A64Cache *cache, uint32_t address) {{");
+        emit!(tables, "    uint32_t low = 0, high = {};", inner.len());
+        emit!(tables, "    while (low < high) {{");
+        emit!(tables, "        uint32_t middle = (low + high) / 2;");
+        emit!(tables, "        if (a64_inner[middle].address < address) low = middle + 1;");
+        emit!(tables, "        else high = middle;");
+        emit!(tables, "    }}");
+        emit!(tables, "    if (a64_inner[low].address == address) {{");
+        emit!(tables, "        cache->inner = a64_inner[low].inner;");
+        emit!(tables, "        cache->address = address;");
+        emit!(tables, "    }}");
+        emit!(tables, "}}\n");
+    }
     emit!(tables, "RECOMP_EXPORT const uint32_t recomp_abi = RECOMP_ABI;");
     // code built to reach memory straight through the host's view of it
     emit!(tables, "#ifdef RECOMP_FASTMEM\nRECOMP_EXPORT const uint32_t recomp_fastmem = 1;\n#endif");
@@ -300,6 +405,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         files.push(("overrides.h".to_owned(), header));
     }
     files.extend(sources.into_iter().enumerate().map(|(i, source)| (format!("code{i:03}.c"), source)));
+    files.extend(assembly.into_iter().enumerate().map(|(i, text)| (format!("a64_{i:03}.S"), text)));
     files
 }
 
@@ -421,6 +527,18 @@ mod tests {
         let analysis = discover::analyze(&program);
         let units = [Unit { module: None, program: &program, analysis: &analysis }];
         generate(&units, overrides).into_iter().collect()
+    }
+
+    #[test]
+    fn a_function_too_big_to_compile_is_left_to_the_interpreter() {
+        let function = |count: usize| Function {
+            source: crate::discover::Source::Entry,
+            mode: Mode::Arm,
+            instructions: (0..count as u32).map(|i| 0x100000 + i * 4).collect(),
+            labels: [0x100000].into(),
+        };
+        assert!(recompiles(0x100000, &function(MOST_INSTRUCTIONS)));
+        assert!(!recompiles(0x100000, &function(MOST_INSTRUCTIONS + 1)));
     }
 
     #[test]

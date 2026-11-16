@@ -12,6 +12,7 @@ use recomp_abi::{Code, Context, Host, EXIT_BUDGET, EXIT_SVC, EXIT_UNWIND};
 use zakuro_cpu::{Bus, Cpu, Exit};
 
 use crate::memory::Memory;
+use crate::System;
 
 pub use recomp_abi::Linked;
 
@@ -25,6 +26,8 @@ pub struct Library {
     code: recomp_abi::Library,
     /// instructions the code handed to the interpreter one at a time.
     fallbacks: Cell<u64>,
+    /// svcs the code ran in place and went on after.
+    in_place: Cell<u64>,
     /// the code found for addresses lately, each in a slot its address
     /// picks. a jump through a register looks its target up, which is a
     /// search through every function otherwise.
@@ -37,6 +40,14 @@ type Found = Cell<(u32, Option<Code>)>;
 /// slots of Library::found, a power of two.
 const FOUND: usize = 1 << 16;
 
+/// the slot of Library::found an address goes in, the top bits of the
+/// address times the golden ratio. ARM addresses step by four and Thumb ones
+/// by two with bit 0 set, and taking low bits would leave half the slots to
+/// one of them.
+fn slot(address: u32) -> usize {
+    (address.wrapping_mul(0x9E37_79B1) >> (32 - FOUND.trailing_zeros())) as usize
+}
+
 /// why a run of recompiled code ended.
 pub enum Stop {
     /// an svc, the cpu is already past it.
@@ -46,15 +57,31 @@ pub enum Stop {
     /// the budget ran out, or execution left for code the library does not
     /// have.
     Left,
+    /// after an svc it ran in place, the code had no budget for the next
+    /// block, which the step after the svc would have found too.
+    Declined,
 }
 
 /// what the callbacks reach through the context.
 struct Machine<'a> {
-    cpu: &'a mut Cpu,
-    memory: &'a mut Memory,
+    /// the system the code runs in, which the library is out of meanwhile.
+    system: *mut System,
     library: &'a Library,
     /// what the interpreter stopped with inside a callback.
     pending: Option<Exit>,
+    /// the cycle count and the budget when the code started, or went on
+    /// after an svc, and how many instructions it ran before.
+    cycles: u64,
+    budget: i32,
+    ran: u64,
+    /// the step's deadline, and the next event's tick, which the budget
+    /// stops at.
+    deadline: Option<u64>,
+    event: Option<u64>,
+    /// an svc the code ran had the step do more, which the code left for.
+    left: bool,
+    /// the code went on after an svc it ran.
+    went_on: bool,
 }
 
 /// # Safety
@@ -65,34 +92,67 @@ unsafe fn machine<'a>(ctx: *mut Context) -> &'a mut Machine<'a> {
     unsafe { &mut *((*ctx).user as *mut Machine) }
 }
 
+/// the memory the code runs on.
+///
+/// # Safety
+///
+/// as for machine, and nothing else may hold the system.
+unsafe fn memory<'a>(ctx: *mut Context) -> &'a mut Memory {
+    unsafe { &mut (*machine(ctx).system).memory }
+}
+
 unsafe extern "C" fn read8(ctx: *mut Context, address: u32) -> u8 {
-    unsafe { machine(ctx).memory.read8(address) }
+    unsafe { memory(ctx).read8(address) }
 }
 
 unsafe extern "C" fn read16(ctx: *mut Context, address: u32) -> u16 {
-    unsafe { machine(ctx).memory.read16(address) }
+    unsafe { memory(ctx).read16(address) }
 }
 
 unsafe extern "C" fn read32(ctx: *mut Context, address: u32) -> u32 {
-    unsafe { machine(ctx).memory.read32(address) }
+    unsafe { memory(ctx).read32(address) }
 }
 
 unsafe extern "C" fn write8(ctx: *mut Context, address: u32, value: u8) {
-    unsafe { machine(ctx).memory.write8(address, value) }
+    unsafe { memory(ctx).write8(address, value) }
 }
 
 unsafe extern "C" fn write16(ctx: *mut Context, address: u32, value: u16) {
-    unsafe { machine(ctx).memory.write16(address, value) }
+    unsafe { memory(ctx).write16(address, value) }
 }
 
 unsafe extern "C" fn write32(ctx: *mut Context, address: u32, value: u32) {
-    unsafe { machine(ctx).memory.write32(address, value) }
+    unsafe { memory(ctx).write32(address, value) }
 }
 
 fn ctx_thumb(ctx: *mut Context) -> u32 {
     // SAFETY: the context the code handed over
     unsafe { ((*ctx).thumb != 0) as u32 }
 }
+
+/// sets the cpu's flush-to-zero and default NaN as fpscr has them, which the
+/// code built for ARM64 leaves to it, handing back what it had.
+#[cfg(target_arch = "aarch64")]
+fn float_mode(fpscr: u32) -> u64 {
+    let old: u64;
+    // SAFETY: only the two bits change, which nothing but float results reads
+    unsafe { std::arch::asm!("mrs {old}, fpcr", "msr fpcr, {new}", old = out(reg) old, new = in(reg) (fpscr & 0x0300_0000) as u64) };
+    old
+}
+
+#[cfg(target_arch = "aarch64")]
+fn restore_float_mode(fpcr: u64) {
+    // SAFETY: as float_mode
+    unsafe { std::arch::asm!("msr fpcr, {fpcr}", fpcr = in(reg) fpcr) };
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn float_mode(_fpscr: u32) -> u64 {
+    0
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn restore_float_mode(_fpcr: u64) {}
 
 /// runs one instruction the code left to the interpreter.
 unsafe extern "C" fn interpret(ctx: *mut Context, address: u32, _opcode: u32) {
@@ -101,10 +161,15 @@ unsafe extern "C" fn interpret(ctx: *mut Context, address: u32, _opcode: u32) {
         machine.library.fallbacks.set(machine.library.fallbacks.get() + 1);
         crate::interpreted_at(address | ctx_thumb(ctx));
         let ctx = &mut *ctx;
-        load(ctx, machine.cpu);
-        machine.cpu.regs[15] = address;
-        let exit = machine.cpu.step(machine.memory);
-        store(machine.cpu, ctx);
+        let system = &mut *machine.system;
+        load(ctx, &mut system.cpu);
+        system.cpu.regs[15] = address;
+        let fpscr = system.cpu.vfp.fpscr;
+        let exit = system.cpu.step(&mut system.memory);
+        if system.cpu.vfp.fpscr != fpscr {
+            float_mode(system.cpu.vfp.fpscr);
+        }
+        store(&system.cpu, ctx);
         let step = if ctx.thumb != 0 { 2 } else { 4 };
         if exit.is_some() || ctx.r[15] != address.wrapping_add(step) {
             machine.pending = exit;
@@ -117,7 +182,63 @@ unsafe extern "C" fn lookup(ctx: *mut Context, address: u32) -> Option<Code> {
     unsafe { machine(ctx).library.lookup(address) }
 }
 
-static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup };
+/// whether svcs run in place, unless ZAKURO_SVC_IN_PLACE is 0, which has
+/// the code stop at every one.
+pub(crate) fn svcs_in_place() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = std::env::var("ZAKURO_SVC_IN_PLACE").map_or(true, |value| value != "0");
+        if !enabled {
+            log::info!("switch: every svc stops recompiled code, ZAKURO_SVC_IN_PLACE=0");
+        }
+        enabled
+    })
+}
+
+/// runs an svc the code made and has the code go on after it, when the
+/// next step would only run that code on, see System::svc_in_place. one
+/// that can't run in place stops the code for the step to run it.
+unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
+    unsafe {
+        let machine = machine(ctx);
+        let ctx = &mut *ctx;
+        if !svcs_in_place() || !crate::kernel::svc::in_place(number) {
+            ctx.svc = number;
+            ctx.exit = EXIT_SVC;
+            return;
+        }
+        let system = &mut *machine.system;
+        // as far as the step goes, the code stopped at the svc
+        let ran = machine.budget.saturating_sub(ctx.budget).max(0) as u64;
+        machine.ran += ran;
+        load(ctx, &mut system.cpu);
+        system.cpu.cycles = machine.cycles + ran;
+        let fpscr = system.cpu.vfp.fpscr;
+        let next = system.svc_in_place(number, machine.event, machine.deadline, machine.library);
+        if system.cpu.vfp.fpscr != fpscr {
+            float_mode(system.cpu.vfp.fpscr);
+        }
+        store(&system.cpu, ctx);
+        machine.cycles = system.cpu.cycles;
+        match next {
+            Some((budget, event)) => {
+                ctx.budget = budget.min(i32::MAX as u64) as i32;
+                machine.event = event;
+                machine.went_on = true;
+                machine.library.in_place.set(machine.library.in_place.get() + 1);
+            }
+            None => {
+                // the step does the rest, the event looked at already
+                machine.event = None;
+                machine.left = true;
+                ctx.exit = EXIT_UNWIND;
+            }
+        }
+        machine.budget = ctx.budget;
+    }
+}
+
+static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup, svc };
 
 fn load(ctx: &Context, cpu: &mut Cpu) {
     cpu.regs = ctx.r;
@@ -162,7 +283,7 @@ impl Library {
     }
 
     fn new(code: recomp_abi::Library) -> Library {
-        Library { code, fallbacks: Cell::new(0), found: Library::nothing_found() }
+        Library { code, fallbacks: Cell::new(0), in_place: Cell::new(0), found: Library::nothing_found() }
     }
 
     /// every slot of found empty, an address no code starts at in each.
@@ -175,6 +296,11 @@ impl Library {
         self.fallbacks.get()
     }
 
+    /// how many svcs the code ran in place, going on after them.
+    pub fn in_place(&self) -> u64 {
+        self.in_place.get()
+    }
+
     /// how many functions and modules there is code for.
     pub fn describe(&self) -> String {
         self.code.describe()
@@ -183,9 +309,7 @@ impl Library {
     /// the code that can run from address, bit 0 set for Thumb, in the
     /// executable or in a module that is loaded.
     fn lookup(&self, address: u32) -> Option<Code> {
-        // instructions are two bytes apart at least, the low bit is the
-        // instruction set
-        let slot = &self.found[(address as usize >> 1) & (FOUND - 1)];
+        let slot = &self.found[slot(address)];
         match slot.get() {
             (seen, code) if seen == address => code,
             _ => {
@@ -213,10 +337,20 @@ impl Library {
     }
 
     /// runs recompiled code from the cpu's pc for about budget instructions,
-    /// returning how many ran and why it stopped.
-    pub fn run(&self, cpu: &mut Cpu, memory: &mut Memory, budget: u64) -> (u64, Stop) {
-        let cycles = cpu.cycles;
-        let (read_pages, write_pages) = memory.page_tables();
+    /// returning how many ran, why it stopped and the tick of the event its
+    /// budget last stopped at. the code runs the svcs it can in place, going
+    /// on after them, and deadline and event are what the step had, for
+    /// those. the library has to be out of the system, which the code has
+    /// to itself.
+    pub fn run(&self, system: &mut System, budget: u64, deadline: Option<u64>, event: Option<u64>) -> (u64, Stop, Option<u64>) {
+        let budget = budget.min(i32::MAX as u64) as i32;
+        let cycles = system.cpu.cycles;
+        let (read_pages, write_pages) = system.memory.page_tables();
+        let fastmem = system.memory.fastmem();
+        // the code works on the VFP registers where they are, so the
+        // interpreter sees its changes without copying them around
+        let vfp = system.cpu.vfp.regs.as_mut_ptr();
+        let fpscr: *mut u32 = &mut system.cpu.vfp.fpscr;
         let mut ctx = Context {
             r: [0; 16],
             n: 0,
@@ -227,7 +361,7 @@ impl Library {
             thumb: 0,
             ge: 0,
             exclusive: 0,
-            budget: budget.min(i32::MAX as u64) as i32,
+            budget,
             exit: 0,
             svc: 0,
             depth: 0,
@@ -235,18 +369,19 @@ impl Library {
             tls: 0,
             read_pages,
             write_pages,
-            vfp: std::ptr::null_mut(),
-            fpscr: std::ptr::null_mut(),
+            vfp,
+            fpscr,
             host: &HOST,
             user: std::ptr::null_mut(),
-            fastmem: memory.fastmem(),
+            fastmem,
         };
-        store(cpu, &mut ctx);
-        let mut machine = Machine { cpu, memory, library: self, pending: None };
-        // the code works on the VFP registers where they are, so the
-        // interpreter sees its changes without copying them around
-        ctx.vfp = machine.cpu.vfp.regs.as_mut_ptr();
-        ctx.fpscr = &mut machine.cpu.vfp.fpscr;
+        store(&system.cpu, &mut ctx);
+        let host_float_mode = float_mode(system.cpu.vfp.fpscr);
+        // everything the code reaches of the system goes through this one
+        // pointer from here, until the run is over
+        let system: *mut System = system;
+        let mut machine =
+            Machine { system, library: self, pending: None, cycles, budget, ran: 0, deadline, event, left: false, went_on: false };
         ctx.user = &mut machine as *mut Machine as *mut c_void;
 
         let stop = loop {
@@ -264,18 +399,49 @@ impl Library {
             if let Some(exit) = machine.pending.take() {
                 break Stop::Exit(exit);
             }
+            // an svc ran, and the step does the rest
+            if machine.left {
+                break Stop::Left;
+            }
             match ctx.exit {
                 EXIT_SVC => break Stop::Svc(ctx.svc),
+                EXIT_BUDGET if machine.went_on && ctx.budget == machine.budget => break Stop::Declined,
                 EXIT_BUDGET => break Stop::Left,
                 _ => {}
             }
         };
 
-        load(&ctx, machine.cpu);
-        let ran = budget.saturating_sub(ctx.budget.max(0) as u64);
+        restore_float_mode(host_float_mode);
+        // SAFETY: the code is done with the system
+        let cpu = unsafe { &mut (*system).cpu };
+        load(&ctx, cpu);
+        let ran = machine.budget.saturating_sub(ctx.budget.max(0)).max(0) as u64;
         // the interpreter counted the instructions it ran for the code, which
         // the budget already has
-        machine.cpu.cycles = cycles + ran;
-        (ran, stop)
+        cpu.cycles = machine.cycles + ran;
+        (machine.ran + ran, stop, machine.event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_float_mode_flushes_on_arm64_and_goes_back() {
+        let subnormal = || std::hint::black_box(f32::from_bits(1)) * std::hint::black_box(1.0);
+        let host = float_mode(0x0300_0000);
+        let flushed = std::hint::black_box(subnormal());
+        restore_float_mode(host);
+        assert_eq!(flushed.to_bits(), if cfg!(target_arch = "aarch64") { 0 } else { 1 });
+        assert_eq!(subnormal().to_bits(), 1);
+    }
+
+    #[test]
+    fn arm_and_thumb_code_use_every_slot() {
+        let arm: std::collections::BTreeSet<usize> = (0..FOUND as u32).map(|i| slot(0x0010_0000 + 4 * i)).collect();
+        let thumb: std::collections::BTreeSet<usize> = (0..FOUND as u32).map(|i| slot(0x0010_0001 + 2 * i)).collect();
+        assert!(arm.len() > FOUND * 3 / 4, "{} of {FOUND}", arm.len());
+        assert!(thumb.len() > FOUND * 3 / 4, "{} of {FOUND}", thumb.len());
     }
 }

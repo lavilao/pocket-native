@@ -525,6 +525,7 @@ public final class Launcher extends Activity {
         findGames(tree, DocumentsContract.getTreeDocumentId(tree), 0, found);
         for (List<Document> game : found) {
             Document rom = null, code = null, font = null;
+            List<Document> mii = new ArrayList<>();
             for (Document document : game) {
                 if ("game.3ds".equals(document.name)) {
                     rom = document;
@@ -532,6 +533,8 @@ public final class Launcher extends Activity {
                     code = document;
                 } else if ("shared_font.bin".equals(document.name)) {
                     font = document;
+                } else if (miiParts(document.name)) {
+                    mii.add(document);
                 }
             }
             File incoming = incoming();
@@ -539,6 +542,14 @@ public final class Launcher extends Activity {
             copy(open(tree, code.id), new File(incoming, "title.so"), "title.so", code.size, progress);
             if (font != null) {
                 copy(open(tree, font.id), new File(new File(incoming, "sysdata"), "shared_font.bin"), "system font", font.size, progress);
+            }
+            for (Document document : game) {
+                if (document.name.startsWith("vertex/")) {
+                    copy(open(tree, document.id), new File(incoming, document.name), "the game's shader list", document.size, progress);
+                }
+            }
+            for (Document parts : mii) {
+                copy(open(tree, parts.id), new File(new File(incoming, "sysdata"), parts.name), "Mii parts", parts.size, progress);
             }
             settle(incoming);
         }
@@ -553,11 +564,17 @@ public final class Launcher extends Activity {
             code |= "title.so".equals(document.name);
         }
         if (rom && code) {
-            // the system font is in sysdata beside them
+            // the system font is in sysdata beside them, the shaders the
+            // kit found in the game in vertex
             List<Document> files = new ArrayList<>(here);
             for (Document document : here) {
                 if (document.folder && "sysdata".equals(document.name)) {
                     files.addAll(children(tree, document.id));
+                } else if (document.folder && "vertex".equals(document.name)) {
+                    for (Document shader : children(tree, document.id)) {
+                        shader.name = "vertex/" + shader.name;
+                        files.add(shader);
+                    }
                 }
             }
             found.add(files);
@@ -582,7 +599,7 @@ public final class Launcher extends Activity {
 
     /**
      * a pack file: a zip of a game's folder as the kit builds it, game.3ds,
-     * title.so and sysdata/shared_font.bin, in any folder inside it.
+     * title.so, sysdata/shared_font.bin and vertex/, in any folder inside it.
      */
     private int importPack(Uri uri, Progress progress) throws IOException {
         InputStream raw = getContentResolver().openInputStream(uri);
@@ -603,6 +620,10 @@ public final class Launcher extends Activity {
                     code = true;
                 } else if ("shared_font.bin".equals(name)) {
                     copy(zip, new File(new File(incoming, "sysdata"), name), "system font", entry.getSize(), progress);
+                } else if (entry.getName().contains("/vertex/") && !entry.isDirectory()) {
+                    copy(zip, new File(new File(incoming, "vertex"), name), "the game's shader list", entry.getSize(), progress);
+                } else if (miiParts(name)) {
+                    copy(zip, new File(new File(incoming, "sysdata"), name), "Mii parts", entry.getSize(), progress);
                 }
             }
         }
@@ -612,6 +633,11 @@ public final class Launcher extends Activity {
         }
         settle(incoming);
         return 1;
+    }
+
+    /** the Mii parts the kit puts beside the system font, experimental. */
+    private static boolean miiParts(String name) {
+        return "CFL_Res.dat".equals(name) || "CFL_Res.placeholder.dat".equals(name);
     }
 
     private interface Adding {

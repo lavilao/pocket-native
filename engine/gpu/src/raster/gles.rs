@@ -28,15 +28,17 @@ use crate::{GpuMemory, Picture, ScreenRef};
 
 mod between;
 mod display;
+mod prepare;
 mod programs;
 mod sources;
 
 use display::*;
+use prepare::Precache;
 use programs::*;
 use sources::*;
 pub use display::{layout_scale, layout_size, panel_timing, second_window, set_second_shows_top, set_second_stretched, set_second_window, set_stacked, set_top_crop, set_window, stacked};
-pub use programs::{compiling, compiling_stand_ins, note_compiler_crash, shader_compiles};
-pub(crate) use programs::COMPILING;
+pub use programs::{compiling, compiling_stand_ins, note_compiler_crash, preparing, shader_compiles, skip_preparing, waited_draws};
+pub(crate) use programs::{COMPILING, WAITED};
 
 const VERTEX_SIZE: usize = 24 * 4;
 const PROCTEX_WORDS: usize = 8;
@@ -489,13 +491,12 @@ struct Ring {
     mapped: Option<(*mut u8, [Option<glow::Fence>; 4])>,
 }
 
-/// whether rings are mapped for good: on Android, or with
-/// ZAKURO_PERSISTENT, where the driver has buffer storage.
+/// whether rings are mapped for good, where the driver has buffer storage,
+/// unless ZAKURO_NO_PERSISTENT: the R36S's Mali took 11 us a push to map and
+/// unmap, mario kart 7 4% slower.
 fn persistent(gl: &glow::Context) -> bool {
     static PERSISTENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PERSISTENT.get_or_init(|| {
-        (cfg!(target_os = "android") || std::env::var_os("ZAKURO_PERSISTENT").is_some()) && gl.supported_extensions().contains("GL_EXT_buffer_storage")
-    })
+    *PERSISTENT.get_or_init(|| gl.supported_extensions().contains("GL_EXT_buffer_storage") && !crate::switch("ZAKURO_NO_PERSISTENT", "rings written through GL"))
 }
 
 impl Ring {
@@ -592,7 +593,9 @@ struct Texture {
     texture: glow::Texture,
     /// ETC1A4's alpha, which ETC1 leaves out.
     alpha: Option<glow::Texture>,
-    _texels: (Arc<[[u8; 4]]>, Option<crate::raster::Packed>),
+    /// what it was made from, which the texture cache holds while the
+    /// texture's memory stays the same.
+    texels: (Arc<[[u8; 4]]>, Option<crate::raster::Packed>),
     used: u64,
 }
 
@@ -698,6 +701,8 @@ impl<T> Pool<T> {
 
 static WORDS: Pool<u32> = Pool::new();
 static BYTES: Pool<u8> = Pool::new();
+static ARRAYS: Pool<Arc<[u8]>> = Pool::new();
+static SLOTS: Pool<(usize, Attribute)> = Pool::new();
 
 enum Submit {
     Triangles { viewport: [i32; 4], vertices: Vec<u8>, count: i32 },
@@ -918,12 +923,14 @@ impl DrawJob {
                             cache.viewport = Some(viewport);
                         }
                         if cache.cull != Some(cull) {
-                            match cull {
+                            // bit 2 a buffer upside down, its triangles wound
+                            // the other way round in the window
+                            match cull & 3 {
                                 0 => gl.disable(glow::CULL_FACE),
-                                cull => {
+                                mode => {
                                     gl.enable(glow::CULL_FACE);
-                                    gl.front_face(glow::CCW);
-                                    gl.cull_face(if cull == 1 { glow::FRONT } else { glow::BACK });
+                                    gl.front_face(if cull & 4 != 0 { glow::CW } else { glow::CCW });
+                                    gl.cull_face(if mode == 1 { glow::FRONT } else { glow::BACK });
                                 }
                             }
                             cache.cull = Some(cull);
@@ -990,8 +997,13 @@ impl DrawJob {
                                         gl.disable_vertex_attrib_array(slot);
                                     }
                                     local.cache.stride = None;
-                                    local.cache.resident = Some((key, slots));
+                                    if let Some((_, old)) = local.cache.resident.replace((key, slots)) {
+                                        SLOTS.give(old);
+                                    }
+                                } else {
+                                    SLOTS.give(slots);
                                 }
+                                ARRAYS.give(arrays);
                                 0
                             }
                             Attributes::Packed { bytes, stride } => {
@@ -1076,20 +1088,29 @@ impl std::ops::Deref for GlRef {
 /// spares the GPU shading the vertices of scenery out of view.
 #[derive(Default)]
 struct Occlusion {
-    meshes: rustc_hash::FxHashMap<u64, Hidden>,
+    meshes: rustc_hash::FxHashMap<u64, Copies>,
     free: Vec<glow::Query>,
+}
+
+/// a mesh's copies, the first drawn in a picture, the second and so on: a
+/// mesh the game draws in more than one place, as Super Mario 3D Land does
+/// its coins, blocks and enemies, is one mesh to the key, and one copy out
+/// of view left out all of them
+#[derive(Default)]
+struct Copies {
+    picture: u64,
+    drawn: usize,
+    /// how many the last two pictures drew
+    counts: [usize; 2],
+    copies: Vec<Hidden>,
 }
 
 #[derive(Default)]
 struct Hidden {
     query: Option<(glow::Query, u64)>,
     until: u64,
-    /// the picture it was last drawn in, and whether it was drawn twice in
-    /// one: a mesh the game draws in more than one place, as Super Mario 3D
-    /// Land does its coins, blocks and enemies, is the same mesh to the key,
-    /// and one of them out of view would leave out all of them
-    seen: Option<u64>,
-    shared: bool,
+    /// found on screen, drawn without a query until then
+    next: u64,
 }
 
 /// heavy draws left out and heavy draws looked at, for ZAKURO_GLES_TIMES.
@@ -1097,29 +1118,49 @@ static CULLED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::A
 
 /// pictures a mesh found off screen is left out for, two or three frames.
 const HIDDEN_PICTURES: u64 = 8;
+/// pictures one found on screen is drawn without a query: each query costs a
+/// tiled GPU's driver work, and what is on screen mostly stays there
+const SEEN_PICTURES: u64 = 4;
 
 impl Occlusion {
     /// whether to draw the mesh, and the query to draw it inside when it is
     /// tried again.
     /// SAFETY: on the GL thread
     unsafe fn check(&mut self, gl: &glow::Context, key: u64, picture: u64) -> (bool, Option<glow::Query>) {
-        if self.meshes.len() > 8192 {
-            self.meshes.retain(|_, mesh| mesh.query.is_some() || mesh.shared);
-        }
         let Occlusion { meshes, free } = self;
-        let mesh = meshes.entry(key).or_default();
-        if mesh.seen == Some(picture) {
-            mesh.shared = true;
+        if meshes.len() > 8192 {
+            meshes.retain(|_, mesh| {
+                let recent = mesh.picture + HIDDEN_PICTURES >= picture;
+                if !recent {
+                    free.extend(mesh.copies.drain(..).filter_map(|copy| copy.query.map(|(query, _)| query)));
+                }
+                recent
+            });
         }
-        mesh.seen = Some(picture);
-        if mesh.shared {
+        let copies = meshes.entry(key).or_default();
+        if copies.picture != picture {
+            copies.counts = [copies.drawn, copies.counts[0]];
+            (copies.picture, copies.drawn) = (picture, 0);
+        }
+        let index = copies.drawn;
+        copies.drawn += 1;
+        if copies.copies.len() <= index {
+            copies.copies.resize_with(index + 1, Hidden::default);
+        }
+        let stable = copies.counts[0] == copies.counts[1] && copies.drawn <= copies.counts[0];
+        let mesh = &mut copies.copies[index];
+        if !stable {
+            mesh.until = 0;
+            free.extend(mesh.query.take().map(|(query, _)| query));
             return (true, None);
         }
         unsafe {
             if let Some((query, tried)) = mesh.query {
-                if gl.get_query_parameter_u32(query, glow::QUERY_RESULT_AVAILABLE) != 0 {
+                if picture > tried && gl.get_query_parameter_u32(query, glow::QUERY_RESULT_AVAILABLE) != 0 {
                     if gl.get_query_parameter_u32(query, glow::QUERY_RESULT) == 0 {
                         mesh.until = tried + HIDDEN_PICTURES;
+                    } else {
+                        mesh.next = picture + SEEN_PICTURES;
                     }
                     free.push(query);
                     mesh.query = None;
@@ -1130,7 +1171,7 @@ impl Occlusion {
                 CULLED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return (false, None);
             }
-            if mesh.query.is_some() {
+            if mesh.query.is_some() || picture < mesh.next {
                 return (true, None);
             }
             let Some(query) = free.pop().or_else(|| gl.create_query().ok()) else { return (true, None) };
@@ -1520,7 +1561,12 @@ pub struct Gles {
     surfaces: Vec<Surface>,
     framebuffers: rustc_hash::FxHashMap<(Option<usize>, Option<usize>), glow::Framebuffer>,
     textures: rustc_hash::FxHashMap<usize, Texture>,
-    samplers: rustc_hash::FxHashMap<(bool, Wrap, Wrap, Lod, bool), glow::Sampler>,
+    /// texture pack pictures on the GPU, by the hash of the texture each
+    /// replaces.
+    // ponytail: kept for the whole game, a budget and letting the least used
+    // go if a pack ever outgrows the GPU's memory
+    replaced: rustc_hash::FxHashMap<u64, glow::Texture>,
+        samplers: rustc_hash::FxHashMap<(bool, Wrap, Wrap, Lod, bool), glow::Sampler>,
     blank: glow::Texture,
     transfer: Option<glow::Program>,
     reinterpreter: Option<glow::Program>,
@@ -1553,6 +1599,16 @@ pub struct Gles {
     pictures: u64,
     warned_logic_op: bool,
     preloading: bool,
+    precaching: bool,
+    /// the precache list's programs, built at a first start, with the setup
+    /// each came from: one the game uses goes into the manifest then, as the
+    /// next starts prepare the manifest and leave the list.
+    precached: HashMap<ProgramKey, String>,
+    /// where to note the list built once its programs are, beside their
+    /// saved copies, which a cleared cache takes with them.
+    precache_stamp: Option<std::path::PathBuf>,
+    /// the list's lines still to hand out, a few each time the screens go up.
+    precache: Option<Precache>,
     /// the console's resolution times this over 4 is what the surfaces are
     /// drawn at, 4 native.
     quarters: u32,
@@ -1652,6 +1708,7 @@ impl Gles {
                 surfaces: Vec::new(),
                 framebuffers: Default::default(),
                 textures: Default::default(),
+                replaced: Default::default(),
                 samplers: Default::default(),
                 blank,
                 transfer: None,
@@ -1674,12 +1731,19 @@ impl Gles {
                 pictures: 0,
                 warned_logic_op: false,
                 preloading: false,
+                precaching: false,
+                precached: HashMap::new(),
+                precache_stamp: None,
+                precache: None,
                 quarters: 4,
                 natives: Default::default(),
             };
             gles.prepare_helpers();
             gles.preload();
+            gles.preload_precache();
+            gles.preload_vertex_list();
             gles.prepare_stand_ins();
+            PREPARING.store(compiling() + PRECACHE_LEFT.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
             Ok(gles)
         }
     }
@@ -1728,88 +1792,18 @@ impl Gles {
         }
     }
 
-    fn preload(&mut self) {
-        let Some(path) = manifest_path() else { return };
-        let Ok(text) = std::fs::read_to_string(&path) else { return };
-        if text.lines().next() != Some(MANIFEST_HEADER) {
-            log::info!("{} is from another version, starting it over", path.display());
-            let _ = std::fs::remove_file(&path);
-            let _ = vertex_path(&path, 0).parent().map(std::fs::remove_dir_all);
-            return;
+    /// a vertex program's variant for a buffer upside down, y turned over
+    /// where it leaves the program, under a hash of its own so that the
+    /// programs of buffers the right way up stay as they were.
+    fn flipped(&mut self, vertex: u64) -> u64 {
+        const FROM: &str = "gl_Position = vec4(position.xy,";
+        let flipped = vertex ^ 1 << 63;
+        if !self.vertex_sources.contains_key(&flipped) {
+            let Some(source) = self.vertex_sources.get(&vertex).filter(|source| source.contains(FROM)) else { return vertex };
+            let source = source.replace(FROM, "gl_Position = vec4(position.x, -position.y,");
+            self.vertex_sources.insert(flipped, source);
         }
-        let started = std::time::Instant::now();
-        self.preloading = true;
-        // with several compiler threads they all take the list, the start
-        // waiting for the last of them, rather than the GL thread building
-        // one program after another
-        let queue = self.compiler.is_some() && compilers() > 1;
-        let built_before = BUILD_MICROS.load(std::sync::atomic::Ordering::Relaxed);
-        let (mut translating, mut programs) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-        let mut units: HashMap<u64, Option<ShaderUnit>> = HashMap::new();
-        let mut count = 0;
-        for line in text.lines().skip(1) {
-            let mut fields = line.split_whitespace();
-            let vertex = match fields.next() {
-                Some("0") => 0,
-                Some(field) => {
-                    let Ok(parts) = field.split(':').map(|part| u64::from_str_radix(part, 16)).collect::<Result<Vec<u64>, _>>() else { continue };
-                    let Some((&[fingerprint, entry], semantics)) = parts.split_first_chunk::<2>() else { continue };
-                    let Ok(semantics) = <[u32; SEMANTICS]>::try_from(semantics.iter().map(|&value| value as u32).collect::<Vec<u32>>()) else { continue };
-                    let unit = units.entry(fingerprint).or_insert_with(|| {
-                        let bytes = std::fs::read(vertex_path(&path, fingerprint)).ok().filter(|bytes| bytes.len() == (PROGRAM_SIZE + DESCRIPTOR_SIZE) * 4)?;
-                        let mut unit = ShaderUnit::new();
-                        for (word, chunk) in unit.program.iter_mut().chain(unit.descriptors.iter_mut()).zip(bytes.as_chunks::<4>().0) {
-                            *word = u32::from_le_bytes(*chunk);
-                        }
-                        unit.prepare();
-                        Some(unit)
-                    });
-                    let Some(unit) = unit else { continue };
-                    unit.entry_point = entry as u32;
-                    let began = std::time::Instant::now();
-                    let stage = self.vertex_stage(unit, semantics);
-                    translating += began.elapsed();
-                    let Ok(hash) = stage else { continue };
-                    hash
-                }
-                None => continue,
-            };
-            let Some(Ok(flags)) = fields.next().map(|field| u32::from_str_radix(field, 16)) else { continue };
-            let mut r = [0u32; 0x300];
-            for (register, value) in fields.filter_map(|field| field.split_once('=')) {
-                if let (Ok(register @ 0..0x300), Ok(value)) = (usize::from_str_radix(register, 16), u32::from_str_radix(value, 16)) {
-                    r[register] = value;
-                }
-            }
-            let mut packed = Vec::new();
-            if flags & 1 << 17 != 0 {
-                let Some(lighting) = crate::lighting::Lighting::read(&r) else { continue };
-                lighting.pack(&mut packed);
-            }
-            let (writes_depth, sources) = (flags & 1 << 16 != 0, std::array::from_fn(|unit| flags & 1 << (8 + unit) != 0));
-            let (constants, lighting) = fragment_constants(&r, flags & 7, flags >> 4 & 7, sources, flags >> 12 & 3, writes_depth, (flags & 1 << 17 != 0).then_some(&packed[..]));
-            let began = std::time::Instant::now();
-            match self.program(&constants, writes_depth, &lighting, vertex, !queue, None) {
-                Ok(_) => count += 1,
-                Err(error) => log::warn!("could not prepare a shader from {}, {error}", path.display()),
-            }
-            programs += began.elapsed();
-        }
-        let waiting = std::time::Instant::now();
-        while self.compiler.as_ref().is_some_and(|compiler| !compiler.pending.is_empty()) {
-            self.take_compiled(true);
-        }
-        self.preloading = false;
-        let built = BUILD_MICROS.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(built_before) as f64 / 1e6;
-        log::info!(
-            "prepared {count} shaders from {} in {:.1} s: {:.1} s translating vertex programs, {:.1} s handing out programs, {:.1} s waiting on the compiler threads, {:.1} s building them in all",
-            path.display(),
-            started.elapsed().as_secs_f64(),
-            translating.as_secs_f64(),
-            programs.as_secs_f64(),
-            waiting.elapsed().as_secs_f64(),
-            built
-        );
+        flipped
     }
 
     pub fn name(&self) -> &str {
@@ -2554,26 +2548,32 @@ impl Gles {
             let offset = t.input.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0)? / tile_rows * step;
             (offset + first + rows <= s.height).then_some(offset)
         };
-        let Some((addr, input_size, row)) = self
+        let output_len = t.output_width * t.output_height * output_kind.bytes();
+        let Some((addr, input_size, row, drawn_under)) = self
             .surfaces
             .iter()
             .filter(|s| s.kind == input_kind && s.tiled == tiled && s.width == t.input_width)
             .filter_map(|s| Some((s, row_in(s)?)))
             .max_by_key(|(s, _)| (s.dirty.is_some(), s.height))
-            .map(|(s, row)| (s.addr, (s.width, s.height), row))
+            .map(|(s, row)| (s.addr, (s.width, s.height), row, s.dirty_overlaps(t.output, output_len)))
         else {
             return self.transfer_below_memory(memory, t);
         };
         let input_end = addr as u64 + (input_size.0 * input_size.1 * input_kind.bytes()) as u64;
-        let output_end = t.output as u64 + (t.output_width * t.output_height * output_kind.bytes()) as u64;
+        let output_end = t.output as u64 + output_len as u64;
         // a tiled output wider than the copy has its last row of tiles' end
         // left as it was, which may be the input's start: Yo-kai Watch 2
         // copies its 240 wide top screen into a texture 256 wide just before it
         let gap = if t.output_tiled && t.copy.0 < t.output_width && t.copy.1 == t.output_height { ((t.output_width - t.copy.0) * 8 * output_kind.bytes()) as u64 } else { 0 };
-        if (addr as u64) < output_end - gap && (t.output as u64) < input_end {
+        // or the output takes rows of the drawing nothing drew and the copy
+        // doesn't read, as RE:R and MH3U put their bottom screen just
+        // before the rows of the drawing they copy to it
+        let read = (addr as u64 + ((row + first) / step * tile_rows) as u64, addr as u64 + ((row + first + rows).div_ceil(step) * tile_rows) as u64);
+        let beside = !drawn_under && (read.1 <= t.output as u64 || output_end <= read.0);
+        if !beside && (addr as u64) < output_end - gap && (t.output as u64) < input_end {
             return Ok(false);
         }
-        let tail = ((addr as u64) < output_end && (t.output as u64) < input_end).then_some(gap as u32);
+        let tail = (!beside && (addr as u64) < output_end && (t.output as u64) < input_end).then_some(gap as u32);
         self.current()?;
         let (source, target) = loop {
             let source = self.surface_rows(memory, addr, input_size, input_kind, tiled, None)?;
@@ -2872,7 +2872,19 @@ impl Gles {
     fn program(&mut self, constants: &[u32; FRAGMENT_CONSTANTS], writes_depth: bool, lighting: &[u32], vertex: u64, wait: bool, inputs: Option<&dyn Fn() -> String>) -> Result<Option<glow::Program>, String> {
         let key = (*constants, writes_depth, lighting.to_vec(), vertex);
         if let Some(&program) = self.programs.get(&key) {
+            if !self.precached.is_empty() && !self.preloading {
+                if let Some(setup) = self.precached.remove(&key) {
+                    self.inputs.insert(key.clone(), setup);
+                    self.note_program(&key);
+                }
+            }
             return Ok(Some(program));
+        }
+        // a precached one left as a saved copy, loaded on its first use
+        if !self.preloading {
+            if let Some(setup) = self.precached.remove(&key) {
+                self.inputs.insert(key.clone(), setup);
+            }
         }
         // what the compiler finished, still compiles or could not, and what
         // it is given, are seen to here, only a program built here and now
@@ -2920,11 +2932,11 @@ impl Gles {
         if let Some(inputs) = inputs {
             self.inputs.insert(key.clone(), inputs());
         }
-        if !wait && (!self.preloading || compilers() > 1) {
+        if !wait {
             if let Some(compiler) = self.compiler.as_mut() {
                 compiler.pending.insert(key.clone());
                 BUILDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if compiler.jobs.send(Compile { key, vertex: compiled, fragment, cached }).is_err() {
+                if compiler.jobs.send(Compile { key, vertex: compiled, fragment, cached, preload: self.preloading, saved: self.precaching }).is_err() {
                     BUILDING.store(0, std::sync::atomic::Ordering::Relaxed);
                     BUILDING_STAND_INS.store(0, std::sync::atomic::Ordering::Relaxed);
                     self.compiler = None;
@@ -2940,7 +2952,7 @@ impl Gles {
         disturb();
         let program = match build_program(&self.gl, &compiled, &fragment, cached.as_deref()) {
             Ok(program) => program,
-            Err(error) if self.retried.insert(key.clone()) => {
+            Err(error) if error != REFUSED && self.retried.insert(key.clone()) => {
                 log::warn!("{error}");
                 self.make_room();
                 build_program(&self.gl, &compiled, &fragment, cached.as_deref())?
@@ -2973,13 +2985,21 @@ impl Gles {
                     self.programs.insert(key.clone(), program);
                     self.note_program(&key);
                 }
+                Err(error) if error == SAVED => {}
+                Err(error) if error == SKIPPED => {
+                    self.inputs.remove(&key);
+                    self.precached.remove(&key);
+                    self.precache_stamp = None;
+                }
                 Err(error) => {
-                    log::warn!("{error}");
                     // the driver out of memory, most likely: the next draw
                     // that needs it tries again once room is made
-                    if self.retried.insert(key.clone()) {
-                        self.make_room();
-                        continue;
+                    if error != REFUSED {
+                        log::warn!("{error}");
+                        if self.retried.insert(key.clone()) {
+                            self.make_room();
+                            continue;
+                        }
                     }
                     self.inputs.remove(&key);
                     if key.3 != 0 {
@@ -2990,6 +3010,13 @@ impl Gles {
                         }
                     }
                     self.compiler.as_mut().expect("the compiler is still there").failed.insert(key, error);
+                }
+            }
+        }
+        if self.compiler.as_ref().is_some_and(|compiler| compiler.pending.is_empty()) {
+            if let Some(path) = self.precache_stamp.take() {
+                if let Err(error) = std::fs::write(&path, "") {
+                    log::warn!("could not note the precache list built in {}, {error}", path.display());
                 }
             }
         }
@@ -3184,7 +3211,21 @@ impl Gles {
         let size = self.surfaces[index].size();
         let row = self.surfaces[index].row_bytes();
         let (from, to) = rows.map_or((addr, size), |(start, end)| (addr + start * row, (end - start) * row));
-        let others = self.adopt_all(index, from, to)?;
+        let mut others = self.adopt_all(index, from, to)?;
+        // a depth buffer a colour buffer is drawn over is another buffer's
+        // memory by now, as one a fill runs over is: Kid Icarus draws a small
+        // colour buffer where its scene's depth was, every frame
+        if matches!(self.surfaces[index].kind, Kind::Color(_)) && crate::fast_with(crate::speedup::CLEARS) {
+            for &other in &others {
+                let s = &mut self.surfaces[other];
+                if matches!(s.kind, Kind::Depth(_)) {
+                    s.shadow.resize(s.size() as usize, 0);
+                    memory.read(s.addr, &mut s.shadow);
+                    (s.dirty, s.checked, s.picture) = (None, false, None);
+                }
+            }
+            others.retain(|&other| !matches!(self.surfaces[other].kind, Kind::Depth(_)));
+        }
         if !others.is_empty() {
             self.write_back(memory, others)?;
         }
@@ -3673,7 +3714,15 @@ impl Gles {
         }
         let mut gone = Vec::new();
         self.textures.retain(|_, texture| {
-            let keep = flushes - texture.used < TEXTURE_KEEP_FLUSHES;
+            // one whose texels the cache let go of, for new ones at the same
+            // place, is never asked for again: a video's every picture would
+            // stay its 600 batches otherwise, memory running out on a 1 GB
+            // handheld
+            let replaced = match &texture.texels {
+                (_, Some((_, bytes))) => Arc::strong_count(bytes) == 1,
+                (texels, None) => Arc::strong_count(texels) == 1,
+            };
+            let keep = flushes - texture.used < TEXTURE_KEEP_FLUSHES && !replaced;
             if !keep {
                 gone.extend([Some(texture.texture), texture.alpha].into_iter().flatten());
             }
@@ -3772,6 +3821,9 @@ impl Gles {
     }
 
     pub(crate) fn present(&mut self, shown: [Option<(crate::PanelImage, [i32; 4])>; 2], cursor: Option<(i32, i32)>, overlays: Vec<Arc<crate::Overlay>>, smooth: bool, interpolate: bool, frames: u32) {
+        if self.precache.is_some() {
+            self.precache_some(std::time::Duration::from_millis(100));
+        }
         let mut parts = Vec::new();
         for (index, item) in shown.into_iter().enumerate() {
             let Some((image, area)) = item else { continue };
@@ -3800,9 +3852,11 @@ impl Gles {
         // with two waiting for the panel already, this one waits its turn:
         // dropped, its frame would have been drawn for nothing, where held
         // up, the title falls behind and skips drawing frames instead
+        let held = std::time::Instant::now();
         while self.presenting.load(std::sync::atomic::Ordering::Acquire) >= 2 {
             std::thread::sleep(std::time::Duration::from_micros(500));
         }
+        crate::PANEL_HELD.fetch_add(held.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         self.presenting.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let presenting = self.presenting.clone();
         let gl = self.gl;
@@ -4012,6 +4066,11 @@ impl Gles {
 
     fn texture(&mut self, bound: &BoundTexture) -> Result<(glow::Texture, Option<glow::Texture>), String> {
         let _timed = timed(6);
+        if let Some(material) = &bound.replacement {
+            if let Some(texture) = self.replacement(material)? {
+                return Ok((texture, None));
+            }
+        }
         let key = bound.packed.as_ref().map_or(Arc::as_ptr(&bound.texels) as *const u8, |(_, bytes)| Arc::as_ptr(bytes) as *const u8) as usize;
         if let Some(texture) = self.textures.get_mut(&key) {
             texture.used = self.flushes;
@@ -4093,8 +4152,37 @@ impl Gles {
                 }
             }
         });
-        self.textures.insert(key, Texture { texture, alpha, _texels: (bound.texels.clone(), bound.packed.clone()), used: self.flushes });
+        self.textures.insert(key, Texture { texture, alpha, texels: (bound.texels.clone(), bound.packed.clone()), used: self.flushes });
         Ok((texture, alpha))
+    }
+
+    /// a texture pack's picture on the GPU, once it has been read, none
+    /// until then, the texture drawing as it is meanwhile.
+    fn replacement(&mut self, material: &Arc<crate::pack::Material>) -> Result<Option<glow::Texture>, String> {
+        if let Some(&texture) = self.replaced.get(&material.hash()) {
+            return Ok(Some(texture));
+        }
+        // read in the background, asked for again by each draw until it is
+        let Some(picture) = material.picture(4096) else { return Ok(None) };
+        let texture = self.texture_name()?;
+        let gl = self.gl;
+        self.worker.post_keeping(move || {
+            disturb();
+            // SAFETY: on the GL thread, the name is new and each level's
+            // texels lie inside the picture's
+            unsafe {
+                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                gl.tex_storage_2d(glow::TEXTURE_2D, picture.levels.len() as i32, glow::RGBA8, picture.width as i32, picture.height as i32);
+                for (index, level) in picture.levels.iter().enumerate() {
+                    let bytes = &picture.texels[level.offset..level.offset + (level.width * level.height * 4) as usize];
+                    gl.tex_sub_image_2d(glow::TEXTURE_2D, index as i32, 0, 0, level.width as i32, level.height as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(bytes)));
+                }
+            }
+        });
+        // the GPU's copy is the one kept, read again should it go
+        material.release();
+        self.replaced.insert(material.hash(), texture);
+        Ok(Some(texture))
     }
 
     /// a sampler magnifying bilinear or not, minifying as lod has it,
@@ -4250,9 +4338,14 @@ impl Gles {
             Geometry::Shaded(shading) => self.vertex_stage(shading.unit, shading.semantics)?,
             Geometry::Triangles(_) => 0,
         };
+        // a buffer upside down: its vertex program's own variant, y turned
+        // over, the viewport mirrored and the winding with it. the CPU placed
+        // its own triangles that way already
+        let flip = matches!(draw.geometry, Geometry::Shaded(_)) && super::upside_down(draw.registers);
+        let vertex = if flip { self.flipped(vertex) } else { vertex };
 
         let (cull, count) = match draw.geometry {
-            Geometry::Shaded(shading) => (shading.cull, shading.indices.len()),
+            Geometry::Shaded(shading) => (shading.cull | (flip as u32) << 2, shading.indices.len()),
             Geometry::Triangles(triangles) => (0, triangles.len() * 3),
         };
         let r = draw.registers;
@@ -4431,7 +4524,13 @@ impl Gles {
         let writable = r[REG_DEPTH_STENCIL_WRITE] != 0;
         let depth_test = mask & 1 != 0;
         let depth_write = writable && mask & (1 << 12) != 0;
-        let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && r[REG_STENCIL_TEST] & 1 != 0;
+        // the stencil's operations apply with its test's bit clear too, the
+        // test then passing always, see Stencil::read
+        let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && super::Stencil::read(r, writable).is_some();
+        let stencil_compare = match r[REG_STENCIL_TEST] & 1 {
+            0 => r[REG_STENCIL_TEST] & !0x70 | 0x10,
+            _ => r[REG_STENCIL_TEST],
+        };
         let blend = (r[REG_COLOR_OPERATION] & 0x100 != 0).then_some(r[REG_BLEND_FUNC]);
         let mut color_mask = color_mask;
         match LogicOp::read(r) {
@@ -4466,22 +4565,21 @@ impl Gles {
             },
             Geometry::Shaded(shading) => {
                 let (x, y, width, height) = shading.viewport;
+                let y = if flip { draw.height as f32 - y - height } else { y };
                 let viewport = [(x * k).round() as i32, ((y + raise as f32) * k).round() as i32, (width * k).round() as i32, (height * k).round() as i32];
                 let shaded = timed(16);
                 let (uniforms, inputs, stride) = Self::shading_bytes(shading, depth_map);
                 let attributes = match shading.fetched {
                     Some(fetched) if crate::fast_with(crate::speedup::ARRAYS) => {
                         let read = shading.unit.inputs_read();
-                        let slots = (0..INPUT_REGISTERS)
-                            .filter(|r| read & (1 << r) != 0)
-                            .map(|register| match fetched.inputs[register] {
-                                Input::Array { array, offset, ty, count } => {
-                                    (array, Attribute::Array { offset: offset as usize, ty, count, stride: fetched.arrays[array].stride })
-                                }
-                                Input::Constant(value) => (0, Attribute::Constant(value)),
-                            })
-                            .collect();
-                        Attributes::Resident { arrays: fetched.arrays.iter().map(|array| array.bytes.clone()).collect(), slots }
+                        let mut slots = SLOTS.take(INPUT_REGISTERS);
+                        slots.extend((0..INPUT_REGISTERS).filter(|r| read & (1 << r) != 0).map(|register| match fetched.inputs[register] {
+                            Input::Array { array, offset, ty, count } => (array, Attribute::Array { offset: offset as usize, ty, count, stride: fetched.arrays[array].stride }),
+                            Input::Constant(value) => (0, Attribute::Constant(value)),
+                        }));
+                        let mut arrays = ARRAYS.take(fetched.arrays.len());
+                        arrays.extend(fetched.arrays.iter().map(|array| array.bytes.clone()));
+                        Attributes::Resident { arrays, slots }
                     }
                     Some(fetched) => {
                         let mut bytes = BYTES.take(fetched.arrays.iter().map(|array| array.bytes.len() + 16).sum());
@@ -4523,7 +4621,7 @@ impl Gles {
                     }
                 };
                 drop(shaded);
-                Submit::Shaded { viewport, cull: shading.cull, uniforms, attributes, indices, count: kept as i32, range, resident_indices }
+                Submit::Shaded { viewport, cull, uniforms, attributes, indices, count: kept as i32, range, resident_indices }
             }
         };
         static CULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4542,7 +4640,7 @@ impl Gles {
                 None
             },
             depth_mask: depth.is_some() && depth_write,
-            stencil: stencil_test.then(|| (r[REG_STENCIL_TEST], r[REG_STENCIL_OP] & 0x777, writable)),
+            stencil: stencil_test.then(|| (stencil_compare, r[REG_STENCIL_OP] & 0x777, writable)),
             bound,
             uniforms: words,
             vertex_array: self.vertex_array,
@@ -4647,7 +4745,9 @@ impl Gles {
                 let hash = fnv(&[&source]);
                 self.vertex_sources.insert(hash, source);
                 self.vertex_inputs.insert(hash, key);
-                if let (false, Some(path)) = (self.preloading, manifest_path()) {
+                // the manifest's lines need it, a vertex shader from the
+                // kit's list included
+                if let Some(path) = manifest_path() {
                     let file = vertex_path(&path, key.0);
                     let bytes: Vec<u8> = unit.program.iter().chain(unit.descriptors.iter()).flat_map(|word| word.to_le_bytes()).collect();
                     if std::fs::metadata(&file).map(|meta| meta.len()).ok() != Some(bytes.len() as u64) {
@@ -4730,6 +4830,27 @@ mod tests {
         })
     }
 
+    /// a program the driver turned down is remembered beside its saved
+    /// copy, and the next build of it is turned down without the driver.
+    #[test]
+    fn a_program_the_driver_turned_down_is_not_built_again() {
+        let gles = match Gles::new() {
+            Ok(gles) => gles,
+            Err(error) => {
+                eprintln!("no OpenGL ES here, skipped: {error}");
+                return;
+            }
+        };
+        let dir = std::env::temp_dir().join(format!("zakuro-refused-{}", std::process::id()));
+        let cached = dir.join("0.bin");
+        let broken = "#version 310 es\nvoid main() { not a shader }\n";
+        let build = || gles.worker.run(|| build_program(&gles.gl, broken, broken, Some(&cached)));
+        assert!(build().is_err());
+        assert!(cached.with_extension("refused").exists());
+        assert_eq!(build().unwrap_err(), REFUSED);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_drawn_texture_that_starts_in_memory_is_copied_on_the_gpu() {
         let mut gles = match Gles::new() {
@@ -4782,6 +4903,30 @@ mod tests {
         assert_eq!(read_copy(&mut gles, &over), decoded(&memory, base, lead + drawn));
         // the drawing stayed on the GPU
         assert!(gles.surfaces.iter().any(|s| s.addr == drawing && s.dirty.is_some()));
+    }
+
+    #[test]
+    fn a_texture_the_cache_replaced_goes_with_its_batch() {
+        let mut gles = match Gles::new() {
+            Ok(gles) => gles,
+            Err(error) => {
+                eprintln!("no OpenGL ES here, skipped: {error}");
+                return;
+            }
+        };
+        let bound = |texels: Arc<[[u8; 4]]>| BoundTexture { texels, packed: None, replacement: None, drawn: None, linear: false, wrap_s: Wrap::ClampToEdge, wrap_t: Wrap::ClampToEdge, width: 8, height: 8, border: [0.0; 4], levels: 1, lod: Lod::default() };
+        // one the cache keeps, and a video's pictures, each held only until
+        // the next takes its place
+        let kept: Arc<[[u8; 4]]> = vec![[1, 2, 3, 4]; 64].into();
+        gles.texture(&bound(kept.clone())).unwrap();
+        for picture in 0..50u8 {
+            let texels: Arc<[[u8; 4]]> = vec![[picture; 4]; 64].into();
+            gles.texture(&bound(texels)).unwrap();
+            gles.worker.clone().run(|| ());
+            gles.end_batch();
+        }
+        assert_eq!(gles.textures.len(), 1, "the kept texture alone");
+        assert!(gles.textures.values().any(|texture| Arc::ptr_eq(&texture.texels.0, &kept)));
     }
 
     #[test]
@@ -4947,7 +5092,7 @@ mod tests {
         let job = |name: &str, stand_in: bool| {
             let mut constants = [0u32; FRAGMENT_CONSTANTS];
             constants[29] = stand_in as u32;
-            Compile { key: (constants, false, Vec::new(), 0), vertex: name.to_owned(), fragment: String::new(), cached: None }
+            Compile { key: (constants, false, Vec::new(), 0), vertex: name.to_owned(), fragment: String::new(), cached: None, preload: false, saved: false }
         };
         let queue = Queue::new();
         for (name, stand_in) in [("stand-in 1", true), ("stand-in 2", true), ("draw 1", false), ("stand-in 3", true), ("draw 2", false)] {

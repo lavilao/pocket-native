@@ -1,18 +1,22 @@
-# build.ps1 [rom...] [-Keys aes_keys.txt] [-Out folder] [-Bit32]
+# build.ps1 [rom...] [-Keys aes_keys.txt] [-Out folder] [-Precache] [-Bit32]
 #
 # build.sh for Windows: builds Pocket Native and games for the handheld from
 # your own ROMs, .3ds/.cci or .cia files, compressed (.zcci/.zcia) or not,
 # with your console's aes_keys.txt where they are encrypted, inside a
-# container (Docker Desktop or Podman). With no ROM it asks for them. -Bit32
-# builds each game's code for a 32-bit Android device instead, for the
-# 32-bit app to play. Leaves "Pocket Native" in the output folder, build\ by
+# container (Docker Desktop or Podman). With no ROM it asks for them.
+# -Precache (or PN_PRECACHE=1) lists the shaders the games' models need for
+# the handheld to build when a game first starts, and -Bit32 builds each
+# game's code for a 32-bit Android device instead, for the 32-bit app to
+# play. Leaves "Pocket Native" in the output folder, build\ by
 # default, to copy into roms\ports on the card.
 param(
     [Parameter(Position = 0, ValueFromRemainingArguments = $true)][string[]]$Rom = @(),
     [string]$Keys = "",
     [string]$Out = "",
+    [switch]$Precache,
     [switch]$Bit32
 )
+if ($Precache) { $env:PN_PRECACHE = "1" }
 
 $repo = Split-Path -Parent $PSScriptRoot
 $Host.UI.RawUI.WindowTitle = "Pocket Native"
@@ -39,7 +43,7 @@ if ($Rom.Count -eq 0) {
 }
 foreach ($file in $Rom) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
-        Write-Host "usage: scripts\build.ps1 [rom...] [-Keys aes_keys.txt] [-Out folder] [-Bit32]"
+        Write-Host "usage: scripts\build.ps1 [rom...] [-Keys aes_keys.txt] [-Out folder] [-Precache] [-Bit32]"
         Write-Host "no such file: $file"
         exit 2
     }
@@ -98,7 +102,7 @@ foreach ($file in $Rom) {
         $mounts += @("-v", "$(Split-Path -Parent $gameKeys):/keys:ro")
         $arguments += "/keys/$(Split-Path -Leaf $gameKeys)"
     }
-    & $engine run --rm @mounts -e CARGO_HOME=/work/cargo -e CARGO_TARGET_DIR=/work/target -e HOME=/work -e BITS=$(if ($Bit32) { "32" } else { "64" }) `
+    & $engine run --rm @mounts -e CARGO_HOME=/work/cargo -e CARGO_TARGET_DIR=/work/target -e HOME=/work -e BITS=$(if ($Bit32) { "32" } else { "64" }) -e "PN_PRECACHE=$env:PN_PRECACHE" `
         $image bash /src/scripts/container/inside.sh @arguments
     if ($LASTEXITCODE -ne 0) { $failed += $file }
 }

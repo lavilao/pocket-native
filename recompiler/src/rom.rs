@@ -286,7 +286,13 @@ impl Title {
         let program_id = u64_at(&header, 0x118);
         let exefs = ncch + u32_at(&header, 0x1A0) as u64 * MEDIA_UNIT;
         let romfs_offset = ncch + u32_at(&header, 0x1B0) as u64 * MEDIA_UNIT;
-        let has_romfs = u32_at(&header, 0x1B4) != 0 && flags[7] & 0x02 == 0;
+        let romfs_size = u32_at(&header, 0x1B4) as u64 * MEDIA_UNIT;
+        let has_romfs = romfs_size != 0 && flags[7] & 0x02 == 0;
+        let need = (ncch + u32_at(&header, 0x104) as u64 * MEDIA_UNIT).min(if has_romfs { romfs_offset + romfs_size } else { exefs + u32_at(&header, 0x1A4) as u64 * MEDIA_UNIT });
+        let have = file.metadata()?.len();
+        if have < need {
+            return error(format!("the dump is cut short, {} of the {} MiB the game needs: dump it again", have >> 20, need.div_ceil(1 << 20)));
+        }
 
         let ex = read(&mut file, ncch + NCCH_HEADER_SIZE, 0x400)?;
         let exheader = ExHeader {
@@ -328,11 +334,27 @@ impl Title {
     /// the code, the three segments one after another, decompressed.
     pub fn code(&self) -> Result<Vec<u8>, Error> {
         let raw = self.read(self.code.0, self.code.1 as usize)?;
-        if self.exheader.compress_code {
-            decompress(&raw)
-        } else {
-            Ok(raw)
+        let code = if self.exheader.compress_code { decompress(&raw)? } else { raw };
+        if gba_virtual_console(&code) {
+            return error("a GBA Virtual Console game: the 3DS runs these on its GBA hardware, there is no 3DS code to recompile");
         }
+        Ok(code)
+    }
+
+    /// the console's Mii parts (CFL_Res.dat), which a few titles carry among
+    /// their files, Animal Crossing: New Leaf among them.
+    pub fn mii_parts(&self) -> Option<Vec<u8>> {
+        let romfs = self.romfs.as_ref()?;
+        let mut dirs = vec![romfs.root().ok()?];
+        while let Some(dir) = dirs.pop() {
+            for (_, file) in romfs.files(&dir) {
+                if (0x54..1 << 22).contains(&file.data_size) && self.read_romfs(&file, 0, 0x54).is_some_and(|head| mii_parts(&head, file.data_size)) {
+                    return self.read_romfs(&file, 0, file.data_size as usize);
+                }
+            }
+            dirs.extend(romfs.subdirs(&dir).into_iter().map(|(_, dir)| dir));
+        }
+        None
     }
 
     /// up to len bytes of a RomFS file from offset.
@@ -341,6 +363,12 @@ impl Title {
         let len = len.min(file.data_size.saturating_sub(offset) as usize);
         self.read(romfs.data + file.data_offset + offset, len).ok()
     }
+}
+
+/// whether head starts Mii parts size bytes long: their version, then the
+/// twenty parts' offsets in order, the first just past them.
+pub fn mii_parts(head: &[u8], size: u64) -> bool {
+    head.len() >= 0x54 && u32_at(head, 0) == 0x0509_0014 && u32_at(head, 4) == 0x54 && (1..20).all(|k| u32_at(head, 4 * k) <= u32_at(head, 4 * k + 4)) && (u32_at(head, 80) as u64) < size
 }
 
 /// the level 3 tables of the RomFS whose IVFC header is at offset.
@@ -370,6 +398,11 @@ fn read_romfs(
         files: table(file, 0x1C)?,
         data: level3 + u32_at(&header, 0x24) as u64,
     })
+}
+
+/// GBA Virtual Console code ends in ".CAA" and a 1, ahead of the GBA game it hands to the GBA hardware.
+fn gba_virtual_console(code: &[u8]) -> bool {
+    code.len() >= 16 && &code[code.len() - 16..code.len() - 12] == b".CAA" && u32_at(code, code.len() - 12) == 1
 }
 
 /// undoes the backwards LZSS the SDK compresses .code with, which works from
@@ -432,6 +465,32 @@ pub fn decompress(compressed: &[u8]) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mii_parts_are_known_by_their_header() {
+        // the console's and Azahar's open-source placeholder's first words
+        let words = |words: [u32; 21]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<u8>>();
+        let console = words([0x0509_0014, 0x54, 0x7D0, 0x2CDC, 0x5F14, 0xA848, 0xA894, 0x76E80, 0x7C1C8, 0x7C790, 0x7DF24, 0x7E92C, 0xBCC1C, 0xC2964, 0xC31B0, 0xC5E68, 0xD0F80, 0xD9034, 0xD90F4, 0xFE2B8, 0xFF728]);
+        let placeholder = words([0x0509_0014, 0x54, 0x6C, 0x494, 0xA6C, 0xE94, 0xED4, 0x657C, 0x69D4, 0x6EA4, 0x6EF4, 0x710C, 0x7BBC, 0x7FE4, 0x8070, 0x8288, 0x84A0, 0x8634, 0x8694, 0x8CF8, 0x8E08]);
+        assert!(mii_parts(&console, 1_083_400));
+        assert!(mii_parts(&placeholder, 73_448));
+        assert!(!mii_parts(&console, 0xFF728));
+        let mut shuffled = console.clone();
+        shuffled[8..16].rotate_left(4);
+        assert!(!mii_parts(&shuffled, 1_083_400));
+        assert!(!mii_parts(&console[..0x50], 1_083_400));
+    }
+
+    #[test]
+    fn gba_virtual_console_code_is_told_apart() {
+        let mut code = vec![0; 64];
+        code[48..52].copy_from_slice(b".CAA");
+        code[52] = 1;
+        assert!(gba_virtual_console(&code));
+        code[52] = 0;
+        assert!(!gba_virtual_console(&code));
+        assert!(!gba_virtual_console(b".CAA"));
+    }
 
     /// a literal and a run, the smallest stream that exercises both.
     #[test]

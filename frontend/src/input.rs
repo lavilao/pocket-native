@@ -1,14 +1,14 @@
 //! the handheld's buttons and sticks from evdev, and what they are to the
 //! title under the controls settings.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use zakuro_core::services::hid::PadState;
 
-use crate::settings::{Buttons, Dpad, Settings, Speed, Stick};
+use crate::settings::{Buttons, Dpad, Key, Settings, Speed, Stick};
 
 pub const A: u16 = 305;
 pub const B: u16 = 304;
@@ -41,6 +41,34 @@ const BUTTONS: [(u16, PadState); 12] = [
     (LEFT, PadState::LEFT),
     (RIGHT, PadState::RIGHT),
 ];
+/// the 3DS buttons a game's mapping can move, by name, each with the key
+/// that presses it otherwise.
+pub const MAPPED: [(&str, PadState, u16); 8] = [
+    ("A", PadState::A, A),
+    ("B", PadState::B, B),
+    ("X", PadState::X, X),
+    ("Y", PadState::Y, Y),
+    ("L", PadState::L, L1),
+    ("R", PadState::R, R1),
+    ("Start", PadState::START, START),
+    ("Select", PadState::SELECT, SELECT),
+];
+
+/// the handheld key a mapping names, none for one turned off.
+fn key_code(key: Key) -> Option<u16> {
+    Some(match key {
+        Key::A => A,
+        Key::B => B,
+        Key::X => X,
+        Key::Y => Y,
+        Key::L => L1,
+        Key::R => R1,
+        Key::Select => SELECT,
+        Key::Start => START,
+        Key::Off => return None,
+    })
+}
+
 /// a stick's travel, the most it reports.
 pub const STICK: f32 = 1800.0;
 
@@ -59,8 +87,12 @@ pub struct Pad {
     /// set once a gamepad is used, which hides the touch controls until a
     /// finger is on the screen again.
     pub pad_used: bool,
+    /// the attached gamepad is an RG351P/M OSH PB controller.
+    pub osh_pb: bool,
     /// a finger on a second window's screen, across and down it from 0 to 1.
     pub second_touch: Option<(f32, f32)>,
+    /// the device's own motion sensors, as InputState's motion has them.
+    pub motion: Option<([f32; 3], [f32; 3])>,
 }
 
 /// the pad a program around the frontend fills, in place of evdev's.
@@ -87,10 +119,15 @@ pub fn shared() -> Option<Arc<Mutex<Pad>>> {
 
 /// the handheld's gamepad device and its name.
 pub fn gamepad() -> Option<(String, String)> {
-    let devices = std::fs::read_to_string("/proc/bus/input/devices").ok()?;
-    // muOS hides the pad it reads behind its own, so that one goes first
+    pad_among(&std::fs::read_to_string("/proc/bus/input/devices").ok()?)
+}
+
+/// the pad in /proc/bus/input/devices' text, its event device and name.
+fn pad_among(devices: &str) -> Option<(String, String)> {
+    // muOS hides the pad it reads behind its own, so that one goes first, and
+    // a pad's keyboard half, ROCKNIX's "OSH PB Controller Keyboard", last
     let mut blocks: Vec<&str> = devices.split("\n\n").collect();
-    blocks.sort_by_key(|block| !block.contains("N: Name=\"muOS-Keys\""));
+    blocks.sort_by_key(|block| (!block.contains("N: Name=\"muOS-Keys\""), block.lines().any(|line| line.starts_with("N: Name=") && line.contains("Keyboard"))));
     blocks.into_iter().find_map(|block| {
         // the name comes in quotes
         let name = block.lines().find_map(|line| line.strip_prefix("N: Name="))?.trim_matches('"');
@@ -125,8 +162,20 @@ fn rk3562_pad(name: &str) -> bool {
 
 /// the Miyoo Flip's pad under spruceOS: the usual gamepad codes (304 to 318,
 /// no 312/313), the d-pad as a hat, the triggers only as ABS_Z and ABS_RZ.
+/// TrimUI's handhelds (the Smart Pro) give theirs the same way.
 fn miyoo_pad(name: &str) -> bool {
-    name.trim_matches('"').starts_with("MIYOO Player")
+    let name = name.trim_matches('"');
+    name.starts_with("MIYOO Player") || name.starts_with("TRIMUI Player")
+}
+
+/// the RG351P/M's internal USB gamepad.
+pub fn osh_pb_pad(name: &str) -> bool {
+    name == "OpenSimHardware OSH PB Controller"
+}
+
+/// whether Start with the function button, or the OSH PB's Select, exits.
+pub fn exit_combo(keys: &HashSet<u16>, start_pressed: bool, osh: bool) -> bool {
+    start_pressed && (keys.contains(&FN) || keys.contains(&L3) || osh && keys.contains(&SELECT))
 }
 
 pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
@@ -149,7 +198,9 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
     // any other pad numbering select and start the usual way, as ROCKNIX's
     // drivers do, its R36S's r36s_Gamepad among them
     let keys = std::fs::read_to_string(format!("/sys/class/input/{event}/device/capabilities/key")).unwrap_or_default();
-    let usual = rk3566 || !h700 && !rk3562 && !muos && !miyoo && usual_numbers(&keys);
+    let osh_pb = osh_pb_pad(&name);
+    let usual = rk3566 || !h700 && !rk3562 && !muos && !miyoo && !osh_pb && usual_numbers(&keys);
+    pad.lock().unwrap().osh_pb = osh_pb;
     log::info!(
         "buttons from {name}{}",
         if h700 {
@@ -158,10 +209,12 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
             ", numbered as on Anbernic's RK3566 handhelds"
         } else if rk3562 {
             ", numbered as on the RK3562 handhelds"
+        } else if osh_pb {
+            ", numbered as on the RG351P/M OSH PB controller"
         } else if muos {
             ", numbered as on muOS"
         } else if miyoo {
-            ", numbered as on the Miyoo Flip"
+            ", numbered as on the Miyoo Flip and TrimUI's handhelds"
         } else if usual {
             ", numbered the usual way"
         } else {
@@ -169,7 +222,7 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
         }
     );
     // the R36S's stick each of axes 0 to 5 is, scaled to its travel
-    let sticks = if h700 {
+    let sticks = if h700 || osh_pb {
         // left stick on ABS_Z and ABS_RX, right on ABS_RY and ABS_RZ
         Some([None, None, Some(0), Some(1), Some(3), Some(4)])
     } else if rk3566 {
@@ -229,6 +282,8 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
                         rk3566_button(code)
                     } else if rk3562 {
                         rk3562_button(code)
+                    } else if osh_pb {
+                        osh_pb_button(code)
                     } else if muos {
                         muos_button(code)
                     } else {
@@ -252,20 +307,21 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
                         pad.keys.remove(&key);
                     }
                 }
-                (3, _) if (h700 || muos || usual || miyoo) && matches!(code, 16 | 17) => {
-                    let (less, more) = if code == 16 { (LEFT, RIGHT) } else { (UP, DOWN) };
-                    pad.keys.remove(&less);
-                    pad.keys.remove(&more);
-                    if value != 0 {
-                        pad.keys.insert(if value < 0 { less } else { more });
-                    }
+                (3, _) if (h700 || muos || usual || miyoo || osh_pb) && matches!(code, 16 | 17) => {
+                    set_hat_dpad(&mut pad.keys, code, value);
                 }
                 (3, Some(sticks)) => {
-                    if let Some(axis) = sticks.get(code as usize).copied().flatten() {
-                        pad.axes[axis] = match ranges[code as usize] {
+                    let mapped = if osh_pb {
+                        osh_pb_axis(code)
+                    } else {
+                        sticks.get(code as usize).copied().flatten().map(|axis| (axis, false))
+                    };
+                    if let Some((axis, inverted)) = mapped {
+                        let value = match ranges[code as usize] {
                             Some((least, most)) => ((2 * value - least - most) as f32 / (most - least) as f32 * STICK) as i32,
                             None => value,
                         };
+                        pad.axes[axis] = if inverted { value.saturating_neg() } else { value };
                     }
                 }
                 (3, None) if (code as usize) < pad.axes.len() => {
@@ -282,10 +338,11 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
 
 /// the handheld's touch screens, those giving ABS_MT_POSITION_X, and
 /// whether each is the bottom panel's: on the RG DS under ROCKNIX the one on
-/// fe5e0000.i2c, or where ZAKURO_TOUCH_BOTTOM says.
+/// fe5e0000.i2c, or where ZAKURO_TOUCH_BOTTOM says, BANANA_TOUCH under
+/// BananaOS.
 pub fn touchscreens() -> Vec<(String, bool)> {
     let devices = std::fs::read_to_string("/proc/bus/input/devices").unwrap_or_default();
-    let bottom = std::env::var("ZAKURO_TOUCH_BOTTOM").unwrap_or_else(|_| "fe5e0000.i2c".into());
+    let bottom = std::env::var("ZAKURO_TOUCH_BOTTOM").or_else(|_| std::env::var("BANANA_TOUCH")).unwrap_or_else(|_| "fe5e0000.i2c".into());
     devices
         .split("\n\n")
         .filter_map(|block| {
@@ -383,6 +440,15 @@ pub fn read_touch(path: String, bottom: bool, pad: Arc<Mutex<Pad>>) {
     });
 }
 
+fn set_hat_dpad(keys: &mut HashSet<u16>, code: u16, value: i32) {
+    let (less, more) = if code == 16 { (LEFT, RIGHT) } else { (UP, DOWN) };
+    keys.remove(&less);
+    keys.remove(&more);
+    if value != 0 {
+        keys.insert(if value < 0 { less } else { more });
+    }
+}
+
 /// an H700 handheld's button as the R36S numbers it.
 fn h700_button(code: u16) -> u16 {
     match code {
@@ -399,6 +465,36 @@ fn h700_button(code: u16) -> u16 {
         315 => R2,
         316 => R3,
         other => other,
+    }
+}
+
+/// An RG351P/M's OSH PB controller button as the R36S numbers it.
+fn osh_pb_button(code: u16) -> u16 {
+    match code {
+        304 => A,
+        305 => B,
+        306 => X,
+        307 => Y,
+        308 => L1,
+        309 => R1,
+        310 => START,
+        311 => SELECT,
+        312 => L3,
+        313 => R3,
+        314 => L2,
+        315 => R2,
+        other => other,
+    }
+}
+
+/// An RG351P/M's OSH PB controller axis as the R36S axes, and whether it is inverted.
+fn osh_pb_axis(code: u16) -> Option<(usize, bool)> {
+    match code {
+        2 => Some((0, true)),
+        3 => Some((1, true)),
+        4 => Some((3, false)),
+        5 => Some((4, false)),
+        _ => None,
     }
 }
 
@@ -499,6 +595,21 @@ pub fn parse_keys(spec: &str) -> Vec<(u64, HashSet<u16>)> {
         .collect()
 }
 
+/// a vector from an Android device's sensors, on its axes in its natural
+/// orientation, on the 3DS's instead: the device turned by rotation quarter
+/// turns, as its display reports, and held across or upright, the way
+/// Azahar turns them.
+pub fn to_3ds([x, y, z]: [f32; 3], rotation: u8, portrait: bool) -> [f32; 3] {
+    // across and up the screen as shown, out of it
+    let (across, up) = match rotation % 4 {
+        0 => (x, y),
+        1 => (y, -x),
+        2 => (-x, -y),
+        _ => (-y, x),
+    };
+    if portrait { [-across, z, up] } else { [across, z, -up] }
+}
+
 /// a stick's position from -1 to 1, nothing near the middle.
 pub fn stick(value: i32) -> f32 {
     if value.abs() < 200 { 0.0 } else { (value as f32 / STICK).clamp(-1.0, 1.0) }
@@ -551,15 +662,21 @@ pub fn circle(x: i32, y: i32) -> (f32, f32) {
     (x * scale, y * scale)
 }
 
-/// the title's buttons and circle pad for the keys held and the sticks.
-pub fn controls(keys: &HashSet<u16>, axes: &[i32; 8], settings: &Settings) -> (PadState, f32, f32) {
+/// the title's buttons and circle pad for the keys held and the sticks,
+/// with the game's own mapping over the controls' A and B.
+pub fn controls(keys: &HashSet<u16>, axes: &[i32; 8], settings: &Settings, mapping: &BTreeMap<String, Key>) -> (PadState, f32, f32) {
     let mut buttons = PadState::empty();
     for (key, button) in BUTTONS {
-        let key = match (settings.buttons, key) {
-            (Buttons::Xbox, A) => B,
-            (Buttons::Xbox, B) => A,
-            (Buttons::Xbox, X) => Y,
-            (Buttons::Xbox, Y) => X,
+        let mapped = MAPPED.iter().find(|(_, mapped, _)| *mapped == button).and_then(|(name, ..)| mapping.get(*name));
+        let key = match (mapped, settings.buttons, key) {
+            (Some(&chosen), ..) => match key_code(chosen) {
+                Some(key) => key,
+                None => continue,
+            },
+            (None, Buttons::Xbox, A) => B,
+            (None, Buttons::Xbox, B) => A,
+            (None, Buttons::Xbox, X) => Y,
+            (None, Buttons::Xbox, Y) => X,
             _ => key,
         };
         if keys.contains(&key) && (settings.dpad == Dpad::Dpad || ![UP, DOWN, LEFT, RIGHT].contains(&key)) {
@@ -604,7 +721,97 @@ pub fn cursor_step(speed: Speed) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::sticks_in_order;
+    use super::{exit_combo, osh_pb_axis, osh_pb_button, osh_pb_pad, pad_among, set_hat_dpad, sticks_in_order, A, B, DOWN, FN, L1, L2, L3, LEFT, RIGHT, R1, R2, R3, SELECT, START, UP, X, Y};
+    use std::collections::HashSet;
+
+    #[test]
+    fn a_trimui_pad_is_found_under_spruceos() {
+        // the Smart Pro's devices under spruceOS, as a tester's log named them
+        let devices = ["sunxi-keyboard", "pwm-vibrator", "axp2202-pek", "audiocodec Headphones", "TRIMUI Player1", "Microsoft X-Box 360 pad"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| format!("I: Bus=0019 Vendor=0001 Product=0001 Version=0100\nN: Name=\"{name}\"\nH: Handlers=event{i}\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(pad_among(&devices), Some(("/dev/input/event4".to_owned(), "TRIMUI Player1".to_owned())));
+    }
+
+    #[test]
+    fn the_osh_pb_pad_wins_over_its_keyboard_half() {
+        // an RG351P's devices under ROCKNIX, the keyboard half listed first
+        let devices = ["rk805 pwrkey", "OpenSimHardware OSH PB Controller Keyboard", "OpenSimHardware OSH PB Controller", "adc-keys"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| format!("I: Bus=0003 Vendor=1209 Product=3100 Version=0111\nN: Name=\"{name}\"\nH: Handlers=event{i}\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(pad_among(&devices), Some(("/dev/input/event2".to_owned(), "OpenSimHardware OSH PB Controller".to_owned())));
+    }
+
+    #[test]
+    fn exit_combo_keeps_existing_shortcuts_and_adds_osh_pb_select() {
+        assert!(exit_combo(&HashSet::from([FN]), true, false));
+        assert!(exit_combo(&HashSet::from([L3]), true, false));
+        assert!(exit_combo(&HashSet::from([SELECT]), true, true));
+        assert!(!exit_combo(&HashSet::from([SELECT]), true, false));
+        assert!(!exit_combo(&HashSet::from([SELECT]), false, true));
+    }
+
+    #[test]
+    fn osh_pb_buttons_match_the_r36s_codes() {
+        assert_eq!(
+            [304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315].map(osh_pb_button),
+            [A, B, X, Y, L1, R1, START, SELECT, L3, R3, L2, R2]
+        );
+        assert_eq!(osh_pb_button(316), 316);
+    }
+
+    #[test]
+    fn osh_pb_axes_match_the_r36s_axes_and_inversion() {
+        assert_eq!(osh_pb_axis(2), Some((0, true)));
+        assert_eq!(osh_pb_axis(3), Some((1, true)));
+        assert_eq!(osh_pb_axis(4), Some((3, false)));
+        assert_eq!(osh_pb_axis(5), Some((4, false)));
+        assert_eq!(osh_pb_axis(0), None);
+    }
+
+    #[test]
+    fn recognizes_the_osh_pb_device_name() {
+        assert!(osh_pb_pad("OpenSimHardware OSH PB Controller"));
+        assert!(!osh_pb_pad("retrogame_joypad"));
+    }
+
+    #[test]
+    fn hat_dpad_axes_update_and_release_directions() {
+        let mut keys = HashSet::new();
+        set_hat_dpad(&mut keys, 16, -1);
+        assert!(keys.contains(&LEFT));
+        set_hat_dpad(&mut keys, 16, 1);
+        assert!(!keys.contains(&LEFT));
+        assert!(keys.contains(&RIGHT));
+        set_hat_dpad(&mut keys, 17, -1);
+        assert!(keys.contains(&UP));
+        set_hat_dpad(&mut keys, 17, 0);
+        assert!(!keys.contains(&UP));
+        assert!(!keys.contains(&DOWN));
+        assert!(keys.contains(&RIGHT));
+    }
+
+    #[test]
+    fn sensors_turn_to_the_3ds_axes() {
+        use super::to_3ds;
+        // lying on a table, screen up: out of the screen, whichever way it turned
+        for rotation in 0..4 {
+            assert_eq!(to_3ds([0.0, 0.0, 9.8], rotation, rotation % 2 == 0)[1], 9.8);
+        }
+        // held across, screen facing the player, gravity's reaction up the
+        // screen whichever way the device's natural axes lie: down the 3DS's z
+        assert_eq!(to_3ds([0.0, 9.8, 0.0], 0, false), [0.0, 0.0, -9.8]);
+        assert_eq!(to_3ds([-9.8, 0.0, 0.0], 1, false), [0.0, 0.0, -9.8]);
+        assert_eq!(to_3ds([9.8, 0.0, 0.0], 3, false), [0.0, 0.0, -9.8]);
+        // as Azahar has a phone in portrait
+        assert_eq!(to_3ds([1.0, 2.0, 3.0], 0, true), [-1.0, 3.0, 2.0]);
+    }
 
     #[test]
     fn sticks_follow_the_axes_a_pad_has() {
@@ -638,5 +845,21 @@ mod tests {
         assert!(super::has_bit("260800000000003", super::MT_X));
         // a gamepad's sticks only
         assert!(!super::has_bit("3003b", super::MT_X));
+    }
+
+    /// a game's mapping puts one handheld button on another 3DS button and
+    /// turns one off, the rest keep the controls' layout, Xbox's swap too.
+    #[test]
+    fn a_games_mapping_moves_its_buttons() {
+        use crate::settings::{Buttons, Key, Settings};
+        use zakuro_core::services::hid::PadState;
+        let settings = Settings { buttons: Buttons::Xbox, ..Settings::default() };
+        let mapping = std::collections::BTreeMap::from([("A".to_owned(), Key::Y), ("Start".to_owned(), Key::Off)]);
+        let pressed = |keys: &[u16]| super::controls(&keys.iter().copied().collect(), &[0; 8], &settings, &mapping).0;
+        // one key can press two buttons: Y stays X's as well, as Xbox has it
+        assert_eq!(pressed(&[Y]), PadState::A | PadState::X);
+        assert_eq!(pressed(&[START]), PadState::empty());
+        // B as the controls have it, from the handheld's A under Xbox
+        assert_eq!(pressed(&[A]), PadState::B);
     }
 }

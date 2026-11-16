@@ -93,6 +93,7 @@ fn component(bytes: &[u8], ty: u32) -> f32 {
 }
 
 /// where an attribute sits in a loader's vertex.
+#[derive(Clone, Copy, Default)]
 struct Field {
     id: usize,
     offset: u32,
@@ -100,47 +101,104 @@ struct Field {
     count: u32,
 }
 
+/// up to twelve, in place rather than on the heap: a draw has at most twelve
+/// arrays of at most twelve attributes, and lays them out anew every time
+#[derive(Clone, Copy, Default)]
+struct Twelve<T> {
+    items: [T; 12],
+    len: usize,
+}
+
+impl<T> std::ops::Deref for Twelve<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.items[..self.len]
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Twelve<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<T> Twelve<T> {
+    fn push(&mut self, item: T) {
+        self.items[self.len] = item;
+        self.len += 1;
+    }
+}
+
 /// one attribute array, as a vertex of it is laid out.
+#[derive(Clone, Copy, Default)]
 struct LoaderLayout {
     offset: u32,
     stride: u32,
     /// the bytes of a vertex the fields take.
     size: u32,
-    fields: Vec<Field>,
+    fields: Twelve<Field>,
 }
 
 /// how the attribute arrays lay out a vertex, worked out once for a draw
 /// rather than for every vertex.
+#[derive(Default)]
 struct VertexLayout {
-    loaders: Vec<LoaderLayout>,
+    loaders: Twelve<LoaderLayout>,
+}
+
+/// the registers a vertex layout is read from, the attribute formats and
+/// the twelve arrays.
+const LAYOUT_REGISTERS: std::ops::Range<usize> = REG_ATTRIBUTE_FORMAT_LOW..REG_ATTRIBUTE_LOADER + REG_ATTRIBUTE_LOADER_COUNT * REG_ATTRIBUTE_LOADER_STRIDE;
+
+/// the last draw's vertex layout and the registers it was read from, which
+/// the next draws mostly keep.
+struct LayoutCache {
+    registers: [u32; LAYOUT_REGISTERS.end - LAYOUT_REGISTERS.start],
+    layout: VertexLayout,
+}
+
+impl Default for LayoutCache {
+    fn default() -> Self {
+        LayoutCache { registers: [0; LAYOUT_REGISTERS.end - LAYOUT_REGISTERS.start], layout: VertexLayout::default() }
+    }
 }
 
 impl VertexLayout {
+    #[cfg(test)]
     fn read(registers: &[u32]) -> VertexLayout {
-        let loaders = read_loaders(registers)
-            .iter()
-            .filter(|loader| loader.component_count > 0)
-            .map(|loader| {
-                let mut offset = 0u32;
-                let mut fields = Vec::new();
-                for slot in 0..loader.component_count.min(12) {
-                    let id = ((loader.components >> (slot * 4)) & 0xF) as usize;
-                    if id >= 12 {
-                        // padding, aligned to a word, then 4, 8, 12 or 16 bytes.
-                        offset = offset.next_multiple_of(4) + (id as u32 - 11) * 4;
-                        continue;
-                    }
-                    let (ty, count) = attribute_format(registers, id as u32);
-                    let size = component_size(ty);
-                    // each attribute starts aligned to its component size.
-                    offset = offset.next_multiple_of(size);
-                    fields.push(Field { id, offset, ty, count });
-                    offset += size * count;
+        let mut layout = VertexLayout::default();
+        layout.fill(registers);
+        layout
+    }
+
+    /// the layout the registers give, in place of the one held.
+    fn fill(&mut self, registers: &[u32]) {
+        let loaders = &mut self.loaders;
+        loaders.len = 0;
+        for loader in read_loaders(registers).iter().filter(|loader| loader.component_count > 0) {
+            let mut offset = 0u32;
+            let fields = &mut loaders.items[loaders.len].fields;
+            fields.len = 0;
+            for slot in 0..loader.component_count.min(12) {
+                let id = ((loader.components >> (slot * 4)) & 0xF) as usize;
+                if id >= 12 {
+                    // padding, aligned to a word, then 4, 8, 12 or 16 bytes.
+                    offset = offset.next_multiple_of(4) + (id as u32 - 11) * 4;
+                    continue;
                 }
-                LoaderLayout { offset: loader.offset, stride: loader.stride, size: offset, fields }
-            })
-            .collect();
-        VertexLayout { loaders }
+                let (ty, count) = attribute_format(registers, id as u32);
+                let size = component_size(ty);
+                // each attribute starts aligned to its component size.
+                offset = offset.next_multiple_of(size);
+                fields.push(Field { id, offset, ty, count });
+                offset += size * count;
+            }
+            let slot = &mut loaders.items[loaders.len];
+            (slot.offset, slot.stride, slot.size) = (loader.offset, loader.stride, offset);
+            loaders.len += 1;
+        }
     }
 }
 
@@ -470,8 +528,8 @@ fn fetch_arrays<M: GpuMemory>(
             sources[field.id] = Some((l, f));
         }
     }
-    let mut arrays: Vec<host::FetchedArray> = Vec::new();
-    let mut uploaded: Vec<Option<usize>> = vec![None; layout.loaders.len()];
+    let mut arrays: Vec<host::FetchedArray> = Vec::with_capacity(layout.loaders.len());
+    let mut uploaded: [Option<usize>; 12] = [None; 12];
     let mut inputs = [host::Input::Constant(shader::ZERO); shader::INPUT_REGISTERS];
     for id in 0..count {
         let register = ((map >> (id * 4)) & 0xF) as usize;
@@ -720,6 +778,24 @@ struct Screen {
     view_over_w: Vec4,
 }
 
+/// whether the framebuffer is upside down, the window's rows running from
+/// the top of the buffer down: bit 24 of GPUREG_FRAMEBUFFER_DIMENSIONS
+/// clear. titles set it, Star Fox 64 3D clears it for some passes.
+pub(crate) fn upside_down(registers: &[u32]) -> bool {
+    registers[REG_FRAMEBUFFER_DIMENSIONS] & (1 << 24) == 0
+}
+
+/// the buffer's real width and height, which the tile addressing uses. it
+/// is often padded past the viewport, and tiling at the viewport's width
+/// instead reads back as the image repeating down the screen. a viewport
+/// reaching past it makes it that much larger.
+fn buffer_size(registers: &[u32], (x, y, width, height): (f32, f32, f32, f32)) -> (u32, u32) {
+    let dimensions = registers[REG_FRAMEBUFFER_DIMENSIONS];
+    let right = (x + width).round() as i32;
+    let top = (y + height).round() as i32;
+    ((dimensions & 0x7FF).max(right.max(1) as u32), (((dimensions >> 12) & 0x3FF) + 1).max(top.max(1) as u32))
+}
+
 fn to_screen(vertex: Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> {
     let (vx, vy, vw, vh) = viewport;
     let w = vertex.clip[3];
@@ -816,6 +892,8 @@ struct BoundTexture {
     texels: Arc<[[u8; 4]]>,
     /// the texture in a format of its own size, for a GPU that samples it.
     packed: Option<Packed>,
+    /// the texture pack's picture drawn in its place, by a GPU.
+    replacement: Option<Arc<crate::pack::Material>>,
     drawn: Option<DrawnTexture>,
     /// bilinear rather than point sampling when magnifying.
     linear: bool,
@@ -885,6 +963,7 @@ pub struct Resources {
     /// again for every picture.
     #[cfg(feature = "gles")]
     pub(crate) redrawn_bottom: Option<(u32, u32)>,
+    layout: Box<LayoutCache>,
 }
 
 /// in fast mode, index buffers and vertex arrays as draws read them, kept
@@ -965,6 +1044,10 @@ pub struct TextureCache {
     /// leave memory as it was, but the software path writes what it drew
     /// there when the list ends.
     written: Vec<(u32, u32)>,
+    /// the texture pack whose pictures replace textures, and where a
+    /// texture is laid out to hash it as Citra did.
+    pack: Option<Arc<crate::pack::Pack>>,
+    rows: Vec<u8>,
 }
 
 /// address, format, size, and whether it is packed for a GPU.
@@ -974,11 +1057,16 @@ type TextureKey = (u32, TextureFormat, u32, u32, bool, u32);
 /// a texture as a GPU stores it, and how.
 pub(crate) type Packed = (crate::texture::Packing, Arc<[u8]>);
 
+/// a texture's texels, packed or not, and the texture pack's picture
+/// replacing it.
+type Found = (Arc<[[u8; 4]]>, Option<Packed>, Option<Arc<crate::pack::Material>>);
+
 struct Decoded {
     /// the hash of the bytes it was decoded from.
     hash: u64,
     texels: Arc<[[u8; 4]]>,
     packed: Option<Packed>,
+    replacement: Option<Arc<crate::pack::Material>>,
     /// the list it was last read in, how many writes that list had made by
     /// then, the journal's stamp when it was last checked, and whether a
     /// flush of everything went over it since it was read.
@@ -999,6 +1087,13 @@ const TEXTURE_TRUSTED_LISTS: u64 = 600;
 const TEXTURE_FLUSHED_LISTS: u64 = 64;
 
 impl TextureCache {
+    /// replaces textures with the pack's pictures from now on, or with none.
+    pub fn set_pack(&mut self, pack: Option<Arc<crate::pack::Pack>>) {
+        self.pack = pack;
+        self.entries.clear();
+        self.texels = 0;
+    }
+
     /// a new command list starts.
     pub fn begin_list(&mut self) {
         self.list += 1;
@@ -1017,7 +1112,7 @@ impl TextureCache {
     /// the memory a title's CPU, its services and the GPU write, and the
     /// texture is read again now and then all the same in case a write went
     /// past it.
-    fn checked(&mut self, key: TextureKey, size: u32) -> Option<(Arc<[[u8; 4]]>, Option<Packed>)> {
+    fn checked(&mut self, key: TextureKey, size: u32) -> Option<Found> {
         let (list, written) = (self.list, &self.written);
         let decoded = self.entries.get_mut(&key)?;
         let (checked, writes, stamp, flushed) = decoded.checked;
@@ -1037,11 +1132,11 @@ impl TextureCache {
             true => list - checked < lists,
             false => checked == list,
         };
-        trusted.then(|| (decoded.texels.clone(), decoded.packed.clone()))
+        trusted.then(|| (decoded.texels.clone(), decoded.packed.clone(), decoded.replacement.clone()))
     }
 
     /// the texture decoded from data, which was read after stamp.
-    fn decoded(&mut self, key: TextureKey, data: &[u8], stamp: u64) -> (Arc<[[u8; 4]]>, Option<Packed>) {
+    fn decoded(&mut self, key: TextureKey, data: &[u8], stamp: u64) -> Found {
         let (_, format, width, height, packs, levels) = key;
         let hash = fingerprint(data);
         let checked = (self.list, self.written.len(), stamp, false);
@@ -1049,7 +1144,7 @@ impl TextureCache {
         texture_stats(key, data.len(), hit);
         if let Some(decoded) = self.entries.get_mut(&key).filter(|decoded| decoded.hash == hash) {
             decoded.checked = checked;
-            return (decoded.texels.clone(), decoded.packed.clone());
+            return (decoded.texels.clone(), decoded.packed.clone(), decoded.replacement.clone());
         }
         let count = texture_levels(format, width, height, levels).map(|(w, h, _)| (w * h) as usize).sum::<usize>();
         // a handheld in fast mode has little memory to spare, a quarter
@@ -1083,11 +1178,21 @@ impl TextureCache {
             Some(_) => Arc::from([]),
             None => texture_levels(format, width, height, levels).flat_map(|(w, h, offset)| crate::texture::decode_texels(&data[offset..], format, w, h)).collect(),
         };
-        if let Some(old) = self.entries.insert(key, Decoded { hash, texels: texels.clone(), packed: packed.clone(), checked }) {
+        // packs hash and replace the largest size alone, the smaller ones follow it
+        let base = &data[..(width as usize * height as usize * format.bits_per_pixel() as usize).div_ceil(8).min(data.len())];
+        if crate::pack::recording() {
+            // a packed texture has no texels here, decoded for the record alone
+            let decoded = crate::texture::decode_texels(base, format, width, height);
+            crate::pack::record(base, &decoded, format, width, height);
+        }
+        // the pack's picture for these bytes, hashed only when there is a pack
+        let replacement = self.pack.as_deref().and_then(|pack| pack.find(base, format, width, height, &mut self.rows));
+        let decoded = Decoded { hash, texels: texels.clone(), packed: packed.clone(), replacement: replacement.clone(), checked };
+        if let Some(old) = self.entries.insert(key, decoded) {
             self.texels -= old.texels.len() + old.packed.map_or(0, |(_, bytes)| bytes.len() / 4);
         }
         self.texels += texels.len() + packed.as_ref().map_or(0, |(_, bytes)| bytes.len() / 4);
-        (texels, packed)
+        (texels, packed, replacement)
     }
 }
 
@@ -1248,6 +1353,7 @@ fn empty_texture() -> BoundTexture {
     BoundTexture {
         texels: TEXELS.get_or_init(|| Arc::from([[0u8; 4]].as_slice())).clone(),
         packed: None,
+        replacement: None,
         drawn: None,
         linear: false,
         wrap_s: Wrap::Repeat,
@@ -1297,8 +1403,8 @@ fn bind_texture<M: GpuMemory>(
     let size = texture_levels(format, width, height, levels + 1).last().map_or(0, |(_, _, end)| end);
 
     let key = (addr, format, width, height, packs, levels);
-    let (texels, packed) = match (drawn, cache.checked(key, size as u32)) {
-        (Some(_), _) => (Arc::from([]), None),
+    let (texels, packed, replacement) = match (drawn, cache.checked(key, size as u32)) {
+        (Some(_), _) => (Arc::from([]), None, None),
         (None, Some(decoded)) => decoded,
         (None, None) => {
             let stamp = crate::journal::now();
@@ -1321,6 +1427,7 @@ fn bind_texture<M: GpuMemory>(
     Some(BoundTexture {
         texels,
         packed,
+        replacement,
         drawn,
         levels,
         lod: Lod {
@@ -1504,14 +1611,20 @@ struct Stencil {
 }
 
 impl Stencil {
-    fn read(registers: &[u32]) -> Option<Stencil> {
+    /// the stencil test, none when it does nothing. with bit 0 of
+    /// GPUREG_STENCIL_TEST clear it passes always, as the depth test does,
+    /// but its operations still change the buffer where it may be written:
+    /// Star Fox 64 3D counts its shadow volumes into the stencil that way.
+    fn read(registers: &[u32], writable: bool) -> Option<Stencil> {
         let test = registers[REG_STENCIL_TEST];
-        if test & 1 == 0 {
+        let op = registers[REG_STENCIL_OP];
+        let enabled = test & 1 != 0;
+        let changes = writable && (test >> 8) & 0xFF != 0 && op & 0x777 != 0;
+        if !enabled && !changes {
             return None;
         }
-        let op = registers[REG_STENCIL_OP];
         Some(Stencil {
-            function: Compare::from_raw(test >> 4),
+            function: if enabled { Compare::from_raw(test >> 4) } else { Compare::Always },
             write_mask: (test >> 8) as u8,
             reference: (test >> 16) as u8,
             compare_mask: (test >> 24) as u8,
@@ -1554,7 +1667,7 @@ impl DepthStencil {
         let format = registers[REG_DEPTH_BUFFER_FORMAT] & 0x3;
         let test = (mask & 1 != 0).then(|| Compare::from_raw(mask >> 4));
         let write_depth = writable && mask & (1 << 12) != 0;
-        let stencil = if format == 3 { Stencil::read(registers) } else { None };
+        let stencil = if format == 3 { Stencil::read(registers, writable) } else { None };
         if test.is_none() && !write_depth && stencil.is_none() {
             return None;
         }
@@ -2111,7 +2224,11 @@ pub fn draw<M: GpuMemory>(
     }
 
     let attribute_base = loc_register(registers, REG_ATTRIBUTE_BASE);
-    let layout = VertexLayout::read(registers);
+    if resources.layout.registers[..] != registers[LAYOUT_REGISTERS] {
+        resources.layout.registers.copy_from_slice(&registers[LAYOUT_REGISTERS]);
+        resources.layout.layout.fill(registers);
+    }
+    let layout = &resources.layout.layout;
 
     // resolve each of the vertex_count draw indices to an actual vertex
     // array index, sequential for DrawArrays, looked up in the index buffer
@@ -2243,7 +2360,7 @@ pub fn draw<M: GpuMemory>(
     };
     let inputs: Vec<_> = unique
         .iter()
-        .map(|&vertex_index| fetch_vertex(registers, memory, attribute_base, &layout, fixed_attributes, vertex_index))
+        .map(|&vertex_index| fetch_vertex(registers, memory, attribute_base, &resources.layout.layout, fixed_attributes, vertex_index))
         .collect();
     let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &inputs, order: order.as_deref() };
     rasterize(registers, memory, resources, vertices);
@@ -2340,15 +2457,21 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     // the format sits in bits 16-18 of the register, not the low bits, the low
     // half holds how many bytes a pixel takes.
     let target_format = ColorFormat::from_color_buffer((registers[REG_COLOR_BUFFER_FORMAT] >> 16) & 7);
-    // the buffer's real size, which the tile addressing uses, it is often
-    // padded past the viewport, and tiling at the viewport's width instead
-    // reads back as the image repeating down the screen.
-    let dimensions = registers[REG_FRAMEBUFFER_DIMENSIONS];
     let viewport_right = (viewport_x + viewport_width).round() as i32;
     let viewport_top = (viewport_y + viewport_height).round() as i32;
-    let buffer_width = (dimensions & 0x7FF).max(viewport_right.max(1) as u32);
-    let buffer_height = (((dimensions >> 12) & 0x3FF) + 1).max(viewport_top.max(1) as u32);
+    let (buffer_width, buffer_height) = buffer_size(registers, viewport);
     let (target_width, target_height) = (buffer_width, buffer_height);
+    // drawing stays inside the viewport, its rows turned over on a buffer
+    // upside down
+    let flip = upside_down(registers).then_some(buffer_height as f32);
+    if flip.is_some() && first_time("a buffer drawn upside down") {
+        log::info!("a buffer drawn upside down, its dimensions' bit 24 clear, at {:08X}", registers[REG_COLOR_BUFFER_ADDRESS] << 3);
+    }
+    let (bottom, top) = ((viewport_y.round() as i32).max(0), viewport_top.min(buffer_height as i32));
+    let (bottom, top) = match flip {
+        Some(_) => (buffer_height as i32 - top, buffer_height as i32 - bottom),
+        None => (bottom, top),
+    };
 
     // draws are far more frequent than fills or transfers (thousands per
     // second versus dozens), so this stays at trace level to keep debug
@@ -2400,11 +2523,10 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let state = DrawState {
         target: ColorTarget {
             addr: target_addr,
-            // drawing stays inside the viewport.
             left: (viewport_x.round() as i32).max(0),
-            bottom: (viewport_y.round() as i32).max(0),
+            bottom,
             right: viewport_right.min(buffer_width as i32),
-            top: viewport_top.min(buffer_height as i32),
+            top,
             buffer_width,
             buffer_height,
             format: target_format,
@@ -2492,8 +2614,14 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             match hardware.draw(memory, &draw) {
                 Ok(()) => return (indices.len() / 3) as u32,
                 Err(_) if fetched.is_some() => return NOT_FETCHED,
-                Err(error) if error == gles::COMPILING && skippable => return 0,
-                Err(error) if error == gles::COMPILING => compiling = true,
+                Err(error) if error == gles::COMPILING && skippable => {
+                    gles::WAITED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return 0;
+                }
+                Err(error) if error == gles::COMPILING => {
+                    gles::WAITED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    compiling = true;
+                }
                 Err(error) if first_time(&error) => log::error!("the GPU could not shade, {error}, shading on the CPU"),
                 Err(_) => {}
             }
@@ -2525,7 +2653,15 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let mut triangles = Vec::new();
     for (ia, ib, ic) in triangle_indices {
         let polygon = clip_triangle([shaded[ia], shaded[ib], shaded[ic]]);
-        let screen: Vec<Screen> = polygon.iter().filter_map(|v| to_screen(*v, viewport)).collect();
+        // on a buffer upside down the window's rows run from its top, and the
+        // triangles that turns over cull as they would the right way up
+        let to_window = |vertex: &Vertex| {
+            to_screen(*vertex, viewport).map(|screen| match flip {
+                Some(height) => Screen { y: height - screen.y, ..screen },
+                None => screen,
+            })
+        };
+        let screen: Vec<Screen> = polygon.iter().filter_map(to_window).collect();
         if screen.len() < 3 || screen.len() != polygon.len() {
             clipped_away += 1;
             continue;
@@ -2533,7 +2669,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         if cull_mode != 0 {
             let [p, q, r] = [screen[0], screen[1], screen[2]];
             let counter_clockwise = (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x) > 0.0;
-            if counter_clockwise == (cull_mode == 1) {
+            if (counter_clockwise != flip.is_some()) == (cull_mode == 1) {
                 culled += 1;
                 continue;
             }
@@ -2724,7 +2860,7 @@ mod tests {
         registers[REG_COLOR_BUFFER_ADDRESS] = COLOR >> 3;
         registers[REG_DEPTH_BUFFER_ADDRESS] = DEPTH >> 3;
         registers[REG_DEPTH_BUFFER_FORMAT] = 3;
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (7 << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (7 << 12) | 1 << 24;
         registers[REG_COLOR_BUFFER_WRITE] = 0xF;
         registers[REG_DEPTH_STENCIL_WRITE] = 0x3;
         registers[REG_DEPTH_COLOR_MASK] = 0xF << 8;
@@ -2753,6 +2889,65 @@ mod tests {
     const RED: Vec4 = [1.0, 0.0, 0.0, 1.0];
     const GREEN: Vec4 = [0.0, 1.0, 0.0, 1.0];
     const BLUE: Vec4 = [0.0, 0.0, 1.0, 1.0];
+
+    /// with bit 0 of GPUREG_STENCIL_TEST clear the test passes always, but
+    /// its operations still change the stencil, as Star Fox 64 3D's shadow
+    /// volumes need: a draw marks where a later one testing it fills.
+    #[test]
+    fn the_stencil_changes_with_its_test_off() {
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 4] };
+        // the lower left, its long edge through no pixel's center
+        let triangle = [vertex(-1.0, -1.0), vertex(1.1, -1.0), vertex(-1.0, 1.1)];
+        let mut alone = ConsoleMemory::default();
+        rasterize_shaded(&target_registers(), &mut alone, &mut Resources::default(), &triangle);
+        let expected = pixels(&mut alone);
+        assert!(expected.contains(&[0; 4]) && expected.contains(&[255, 0, 0, 255]));
+
+        let mut memory = ConsoleMemory::default();
+        // the triangle with no colors and the test off, replacing the
+        // stencil with 1 where it draws
+        let mut marking = target_registers();
+        marking[REG_DEPTH_COLOR_MASK] = 0;
+        marking[REG_STENCIL_TEST] = (1 << 4) | (0xFF << 8) | (1 << 16);
+        marking[REG_STENCIL_OP] = 2 << 8;
+        rasterize_shaded(&marking, &mut memory, &mut Resources::default(), &triangle);
+        // then all of the target where the stencil is 1
+        let mut testing = target_registers();
+        testing[REG_STENCIL_TEST] = 1 | (2 << 4) | (1 << 16) | (0xFF << 24);
+        rasterize_shaded(&testing, &mut memory, &mut Resources::default(), &cover(-0.5, RED));
+        assert_eq!(pixels(&mut memory), expected);
+    }
+
+    /// a buffer upside down, bit 24 of its dimensions clear, gets in its
+    /// first rows what the same draw puts in its last ones, and the same
+    /// triangles cull.
+    #[test]
+    fn a_buffer_upside_down_has_the_drawing_turned_over() {
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 4] };
+        // the lower left of the window, wound counter-clockwise
+        let triangle = [vertex(-1.0, -1.0), vertex(0.5, -1.0), vertex(-1.0, 0.25)];
+        // which pixels it covers, row after row of memory
+        let drawn = |flag: u32, cull: u32| {
+            let mut registers = target_registers();
+            registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (7 << 12) | flag;
+            registers[REG_FACE_CULLING] = cull;
+            let mut memory = ConsoleMemory::default();
+            rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &triangle);
+            let pixels = pixels(&mut memory);
+            (0..8).map(|row| (0..8).map(|x| pixels[(crate::format::morton_offset(x, row, 8, 4) / 4) as usize] != [0; 4]).collect()).collect::<Vec<Vec<bool>>>()
+        };
+        let upright = drawn(1 << 24, 0);
+        assert!(upright.iter().flatten().filter(|&&on| on).count() > 8, "too little drawn to tell");
+        assert!(upright[7].iter().any(|&on| on) && !upright[0].iter().any(|&on| on), "drawn at the bottom of the window");
+        let turned: Vec<Vec<bool>> = upright.iter().rev().cloned().collect();
+        assert_eq!(drawn(0, 0), turned);
+        // keeping the counter-clockwise ones keeps it either way up, keeping
+        // the clockwise ones drops it
+        assert_eq!(drawn(1 << 24, 2), upright);
+        assert_eq!(drawn(0, 2), turned);
+        assert!(drawn(1 << 24, 1).iter().flatten().all(|&on| !on));
+        assert!(drawn(0, 1).iter().flatten().all(|&on| !on));
+    }
 
     /// titles map depth with a scale of -1, so near is 1, and keep the
     /// nearer surface with a GREATER test against a buffer cleared to 0.
@@ -2844,7 +3039,7 @@ mod tests {
         registers[REG_VIEWPORT_HEIGHT] = float24(128.0);
         registers[REG_COLOR_BUFFER_ADDRESS] = BIG_COLOR >> 3;
         registers[REG_DEPTH_BUFFER_ADDRESS] = BIG_DEPTH >> 3;
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = 256 | (255 << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 256 | (255 << 12) | 1 << 24;
         let mut memory = ConsoleMemory::default();
         let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0, 0.0, 0.0, 1.0] };
         let quad = [
@@ -2903,6 +3098,7 @@ mod tests {
         let texture = |wrap: Wrap| BoundTexture {
             drawn: None,
             packed: None,
+            replacement: None,
             texels: vec![[0xFF; 4]; 8 * 8].into(),
             linear: false,
             wrap_s: wrap,
@@ -3056,7 +3252,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
 
         let mut seed = 1u32;
         let mut random = move |range: u32| {
@@ -3114,7 +3310,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         let corner = |x: f32, y: f32| Vertex {
             clip: [x, y, -0.5, 1.0],
             color: RED,
@@ -3221,7 +3417,7 @@ mod tests {
         registers[REG_VIEWPORT_XY] = 4 | 6 << 16;
         registers[REG_VIEWPORT_WIDTH] = float24(12.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(12.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         registers[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 | 4 << 4 | 1 << 12;
         registers[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
         registers[REG_DEPTHMAP_ENABLE] = 1;
