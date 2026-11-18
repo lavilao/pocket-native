@@ -810,11 +810,10 @@ impl DrawJob {
                     cache.framebuffer = Some(self.framebuffer);
                 }
                 // a driver may compile a program at its first draw rather
-                // than when it was linked, so the mark that names a crash
-                // there stays for this draw, or none for one already drawn
-                let mut _first_draw = None;
+                // than when it was linked, and on a thread of its own: the
+                // mark names the program the draws are using
                 if cache.program != Some(self.program) {
-                    _first_draw = drawing(self.program);
+                    drawing(self.program);
                     bind_program(&gl, self.program);
                     cache.program = Some(self.program);
                 }

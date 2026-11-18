@@ -157,40 +157,32 @@ fn fingerprint_of(program: glow::Program) -> Option<u64> {
         .and_then(|programs| programs.get(&program.0.get()).copied())
 }
 
-thread_local! {
-    /// programs the GL thread has drawn once: only the first draw is where a
-    /// driver that compiles late does its work.
-    static DRAWN: std::cell::RefCell<rustc_hash::FxHashSet<u32>> = Default::default();
-}
-
-/// marks the first draw of program with the fingerprint of what it was
-/// built from, so a driver that compiles it then and crashes has that
-/// fingerprinted for the next run, which draws what needs it in software.
-/// none once it drew once, or when its sources are not known.
-pub(super) fn drawing(program: glow::Program) -> Option<Drawing> {
+/// marks program as what the draws are using, kept until another program is
+/// bound, so a driver that compiles it at first use and crashes on a thread
+/// of its own has the fingerprint of its sources for the next run, which
+/// draws what needs it in software. nothing when its sources are not known.
+pub(super) fn drawing(program: glow::Program) {
     use std::sync::atomic::Ordering::Relaxed;
-    let name = program.0.get();
-    if DRAWN.with(|drawn| drawn.borrow().contains(&name)) {
-        return None;
-    }
-    let fingerprint = fingerprint_of(program)?;
-    DRAWN.with(|drawn| {
-        drawn.borrow_mut().insert(name);
-    });
+    let Some(fingerprint) = fingerprint_of(program) else { return };
     // SAFETY: gettid has no arguments and cannot fail
     let thread = unsafe { libc::syscall(libc::SYS_gettid) as i64 };
     AT_DRAW.fingerprint.store(fingerprint, Relaxed);
     AT_DRAW.thread.store(thread, Relaxed);
-    Some(Drawing)
 }
 
-/// clears the first draw's mark once the draw is over, however it ends.
-pub(super) struct Drawing;
-
-impl Drop for Drawing {
-    fn drop(&mut self) {
-        AT_DRAW.thread.store(0, std::sync::atomic::Ordering::Relaxed);
+/// whether pc lies in a shader compiler: PowerVR's UniFlex, Mali's, Adreno's,
+/// where a crash while a program is in flight is the program's. elsewhere a
+/// crash is the game's or the translator's, and names no shader.
+unsafe fn in_shader_compiler(pc: u64) -> bool {
+    let mut found: libc::Dl_info = std::mem::zeroed();
+    if libc::dladdr(pc as *const libc::c_void, &mut found) == 0 || found.dli_fname.is_null() {
+        return false;
     }
+    let path = std::ffi::CStr::from_ptr(found.dli_fname).to_bytes();
+    let name = path.rsplit(|&byte| byte == b'/').next().unwrap_or(path);
+    ["usc", "mali", "adreno", "gsl", "glsl"].iter().any(|needle| {
+        name.windows(needle.len()).any(|window| window.iter().zip(needle.bytes()).all(|(&byte, wanted)| byte.to_ascii_lowercase() == wanted))
+    })
 }
 
 /// where the fingerprints of what the compiler crashed on go, for the crash
@@ -267,22 +259,27 @@ impl Drop for Watched {
     }
 }
 
-/// from a fatal signal's handler: when the crashing thread was in the
-/// driver's compiler, writes what it compiled into the log and its
-/// fingerprint into the list the next runs leave out.
+/// from a fatal signal's handler: when the crash was in the driver's shader
+/// compiler, with a build or a draw's program in flight, writes what it was
+/// compiling into the log and its fingerprint into the list the next runs
+/// leave out.
 ///
 /// # Safety
 ///
 /// on the crashing thread in its signal handler, log a file to write to;
 /// nothing here allocates
-pub unsafe fn note_compiler_crash(log: libc::c_int) {
+pub unsafe fn note_compiler_crash(log: libc::c_int, pc: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let here = unsafe { libc::syscall(libc::SYS_gettid) as i64 };
-    // a build in progress, or the first draw of a program a driver compiles
-    // late, with the sources or only their fingerprint to name
+    // a build on this thread; else a build running on another thread, its
+    // sources still there; else a crash inside a shader compiler while a
+    // draw's program is in flight, which the driver may compile on a thread
+    // of its own that inherits its name but not its id
     let (mark, named) = if AT_COMPILER.thread.load(Relaxed) == here {
         (&AT_COMPILER, true)
-    } else if AT_DRAW.thread.load(Relaxed) == here {
+    } else if in_shader_compiler(pc) && AT_COMPILER.thread.load(Relaxed) != 0 {
+        (&AT_COMPILER, true)
+    } else if in_shader_compiler(pc) && AT_DRAW.thread.load(Relaxed) != 0 {
         (&AT_DRAW, false)
     } else {
         return;
@@ -570,9 +567,6 @@ pub(super) fn delete_program(gl: &glow::Context, program: glow::Program) {
     if let Some(programs) = PROGRAM_FINGERPRINTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_mut() {
         programs.remove(&program.0.get());
     }
-    DRAWN.with(|drawn| {
-        drawn.borrow_mut().remove(&program.0.get());
-    });
     let separate = SEPARATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_mut().and_then(|separate| separate.remove(&(SHARE_GROUP.get(), program))).is_some();
     // SAFETY: on the GL thread, after every draw that used it
     unsafe {
