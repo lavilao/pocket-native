@@ -123,6 +123,76 @@ pub(super) static AT_COMPILER: AtCompiler = AtCompiler {
     ],
 };
 
+/// the program the GL thread is drawing with for the first time. some
+/// drivers (PowerVR's UniFlex) compile a program when it is first drawn
+/// rather than when it is linked, and crash there: the compiler mark above
+/// is cleared by then, so the crash named nothing to leave out next run. A
+/// mark of its own, since the compiler threads write theirs.
+static AT_DRAW: AtCompiler = AtCompiler {
+    thread: std::sync::atomic::AtomicI64::new(0),
+    fingerprint: std::sync::atomic::AtomicU64::new(0),
+    sources: [
+        (std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), std::sync::atomic::AtomicUsize::new(0)),
+        (std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()), std::sync::atomic::AtomicUsize::new(0)),
+    ],
+};
+
+/// the fingerprint of what a program was built from, by the program's name,
+/// so that a crash at its first draw records one the next run leaves out.
+static PROGRAM_FINGERPRINTS: std::sync::Mutex<Option<rustc_hash::FxHashMap<u32, u64>>> = std::sync::Mutex::new(None);
+
+fn keep_fingerprint(program: glow::Program, fingerprint: u64) {
+    PROGRAM_FINGERPRINTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(program.0.get(), fingerprint);
+}
+
+fn fingerprint_of(program: glow::Program) -> Option<u64> {
+    PROGRAM_FINGERPRINTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(|programs| programs.get(&program.0.get()).copied())
+}
+
+thread_local! {
+    /// programs the GL thread has drawn once: only the first draw is where a
+    /// driver that compiles late does its work.
+    static DRAWN: std::cell::RefCell<rustc_hash::FxHashSet<u32>> = Default::default();
+}
+
+/// marks the first draw of program with the fingerprint of what it was
+/// built from, so a driver that compiles it then and crashes has that
+/// fingerprinted for the next run, which draws what needs it in software.
+/// none once it drew once, or when its sources are not known.
+pub(super) fn drawing(program: glow::Program) -> Option<Drawing> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let name = program.0.get();
+    if DRAWN.with(|drawn| drawn.borrow().contains(&name)) {
+        return None;
+    }
+    let fingerprint = fingerprint_of(program)?;
+    DRAWN.with(|drawn| {
+        drawn.borrow_mut().insert(name);
+    });
+    // SAFETY: gettid has no arguments and cannot fail
+    let thread = unsafe { libc::syscall(libc::SYS_gettid) as i64 };
+    AT_DRAW.fingerprint.store(fingerprint, Relaxed);
+    AT_DRAW.thread.store(thread, Relaxed);
+    Some(Drawing)
+}
+
+/// clears the first draw's mark once the draw is over, however it ends.
+pub(super) struct Drawing;
+
+impl Drop for Drawing {
+    fn drop(&mut self) {
+        AT_DRAW.thread.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// where the fingerprints of what the compiler crashed on go, for the crash
 /// handler to open.
 pub(super) static CRASHED_PATH: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
@@ -207,28 +277,41 @@ impl Drop for Watched {
 /// nothing here allocates
 pub unsafe fn note_compiler_crash(log: libc::c_int) {
     use std::sync::atomic::Ordering::Relaxed;
-    if AT_COMPILER.thread.load(Relaxed) != unsafe { libc::syscall(libc::SYS_gettid) as i64 } {
+    let here = unsafe { libc::syscall(libc::SYS_gettid) as i64 };
+    // a build in progress, or the first draw of a program a driver compiles
+    // late, with the sources or only their fingerprint to name
+    let (mark, named) = if AT_COMPILER.thread.load(Relaxed) == here {
+        (&AT_COMPILER, true)
+    } else if AT_DRAW.thread.load(Relaxed) == here {
+        (&AT_DRAW, false)
+    } else {
         return;
-    }
+    };
     let write = |file: libc::c_int, bytes: &[u8]| {
         libc::write(file, bytes.as_ptr().cast(), bytes.len());
     };
     write(log, b"the driver's compiler crashed on this, the next runs draw what needs it in software:\n");
-    for (pointer, len) in &AT_COMPILER.sources {
-        let pointer = pointer.load(Relaxed);
-        if !pointer.is_null() {
-            write(log, std::slice::from_raw_parts(pointer, len.load(Relaxed)));
-            write(log, b"\n");
+    if named {
+        for (pointer, len) in &mark.sources {
+            let pointer = pointer.load(Relaxed);
+            if !pointer.is_null() {
+                write(log, std::slice::from_raw_parts(pointer, len.load(Relaxed)));
+                write(log, b"\n");
+            }
         }
     }
+    let fingerprint = mark.fingerprint.load(Relaxed);
+    let mut line = [b'\n'; 17];
+    for (i, digit) in line[..16].iter_mut().enumerate() {
+        *digit = b"0123456789abcdef"[(fingerprint >> (60 - i * 4)) as usize & 15];
+    }
+    // the fingerprint alone when the driver compiled at the draw, the sources
+    // themselves when it crashed in the build
+    write(log, &line[1..]);
+    write(log, b"\n");
     let Some(path) = CRASHED_PATH.get() else { return };
     let file = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND, 0o644);
     if file >= 0 {
-        let fingerprint = AT_COMPILER.fingerprint.load(Relaxed);
-        let mut line = [b'\n'; 17];
-        for (i, digit) in line[..16].iter_mut().enumerate() {
-            *digit = b"0123456789abcdef"[(fingerprint >> (60 - i * 4)) as usize & 15];
-        }
         write(file, &line);
         libc::close(file);
     }
@@ -484,6 +567,12 @@ pub(super) fn bind_program(gl: &glow::Context, program: glow::Program) {
 /// deletes a program a draw used, a separable one's stand-in and pipeline,
 /// its stages kept for others.
 pub(super) fn delete_program(gl: &glow::Context, program: glow::Program) {
+    if let Some(programs) = PROGRAM_FINGERPRINTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_mut() {
+        programs.remove(&program.0.get());
+    }
+    DRAWN.with(|drawn| {
+        drawn.borrow_mut().remove(&program.0.get());
+    });
     let separate = SEPARATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_mut().and_then(|separate| separate.remove(&(SHARE_GROUP.get(), program))).is_some();
     // SAFETY: on the GL thread, after every draw that used it
     unsafe {
@@ -623,7 +712,9 @@ pub(super) fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, ca
     }
     let _timed = Timed(started);
     if separable() {
-        return build_separable(gl, vertex, fragment);
+        let program = build_separable(gl, vertex, fragment)?;
+        keep_fingerprint(program, fnv(&[vertex, fragment]));
+        return Ok(program);
     }
     // one the driver turned down before isn't built again, the driver's own
     // version in the saved copy's name
@@ -713,6 +804,7 @@ pub(super) fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, ca
             }
         }
         log::debug!("program {} in {:.1} ms", if loaded { "loaded" } else { "compiled" }, started.elapsed().as_secs_f64() * 1000.0);
+        keep_fingerprint(program, fnv(&[vertex, fragment]));
         Ok(program)
     }
 }
