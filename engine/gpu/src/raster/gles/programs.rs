@@ -203,6 +203,57 @@ pub(super) fn crashed() -> rustc_hash::FxHashSet<u64> {
     text.lines().filter_map(|line| u64::from_str_radix(line.trim(), 16).ok()).collect()
 }
 
+/// what a draw gives back when its program is one the driver crashed on and
+/// this run leaves those out, ZAKURO_CRASHED_SHADERS=skip: the rasterizer
+/// leaves the draw out as the driver's own crash left it.
+pub(crate) const LEFT_OUT: &str = "left out, the driver crashed on its program";
+
+/// what the draws of a program the driver's compiler crashed on do in the
+/// runs after it, ZAKURO_CRASHED_SHADERS:
+///
+/// - `cpu`, the default, shades their vertices on the CPU, the picture as
+///   the game means it and every draw that needs them slower: a game drawing
+///   most of its scene with those programs pays dear for it, which is what
+///   Monster Hunter 4 Ultimate's four took it from 29 to 20 fps for.
+/// - `stand-in` draws them on the GPU with the generic stand-in fragment
+///   instead of their own: the geometry is there and the frames keep their
+///   speed, the materials the vertex stage's colors alone, the combiners,
+///   textures, fog and lighting left out. It only helps when the stage that
+///   crashed the driver was the fragment one, since the vertex program
+///   drawn with it is still the one the game's own program had.
+/// - `skip` leaves them out, as the driver's own crash did once it took the
+///   process with it: nothing of theirs on the screen, the frame as fast as
+///   any other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Crashed {
+    Cpu,
+    StandIn,
+    Skip,
+}
+
+/// what this run does with draws whose program the driver crashed on, from
+/// ZAKURO_CRASHED_SHADERS, the CPU unless it says otherwise.
+pub(super) fn crashed_shaders() -> Crashed {
+    static WHAT: std::sync::OnceLock<Crashed> = std::sync::OnceLock::new();
+    *WHAT.get_or_init(|| {
+        let chosen = match std::env::var("ZAKURO_CRASHED_SHADERS").as_deref().map(str::trim) {
+            Ok("stand-in" | "standin") => Crashed::StandIn,
+            Ok("skip") => Crashed::Skip,
+            _ => Crashed::Cpu,
+        };
+        if chosen != Crashed::Cpu {
+            log::info!(
+                "a program the driver crashed on{}",
+                match chosen {
+                    Crashed::StandIn => ": its draws go to the GPU with the stand-in fragment, the materials left out",
+                    _ => ": its draws are left out, as the crash left them",
+                }
+            );
+        }
+        chosen
+    })
+}
+
 /// the fragment constants of the program the Redmi 9's PowerVR GE8320,
 /// driver 1.13@5776728, crashed in its compiler on: Rune Factory 4's. The
 /// driver dies in PVRUniFlexCompileToHw, taking the process with it, so the

@@ -325,6 +325,12 @@ pub struct Advanced {
     pub separable_shaders: bool,
     /// a game with a New 3DS mode run as on a New 3DS.
     pub new3ds: bool,
+    /// what draws whose program crashed the driver's shader compiler do in
+    /// the runs after it, ZAKURO_CRASHED_SHADERS: empty shades them on the
+    /// CPU, the picture right and the frames slower for it, "stand-in"
+    /// draws them on the GPU with the generic stand-in fragment, the geometry
+    /// there and the materials left out, "skip" leaves them out.
+    pub crashed_shaders: String,
 }
 
 impl Default for Advanced {
@@ -366,6 +372,7 @@ impl Default for Advanced {
             stand_ins: false,
             separable_shaders: false,
             new3ds: false,
+            crashed_shaders: String::new(),
         }
     }
 }
@@ -440,6 +447,9 @@ impl Advanced {
             } else {
                 std::env::remove_var(variable);
             }
+        }
+        if !self.crashed_shaders.is_empty() {
+            std::env::set_var("ZAKURO_CRASHED_SHADERS", &self.crashed_shaders);
         }
         if !self.prewarm {
             log::info!("switch: shader prewarm off");

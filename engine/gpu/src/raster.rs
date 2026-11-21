@@ -2613,6 +2613,8 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             draw.small = small;
             match hardware.draw(memory, &draw) {
                 Ok(()) => return (indices.len() / 3) as u32,
+                // a program the driver crashed on, left out this run
+                Err(error) if error == gles::LEFT_OUT => return 0,
                 Err(_) if fetched.is_some() => return NOT_FETCHED,
                 Err(error) if error == gles::COMPILING && skippable => {
                     gles::WAITED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2690,6 +2692,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             draw.small = small;
             match hardware.draw(memory, &draw) {
                 Ok(()) => return triangle_count as u32,
+                // a program the driver crashed on, left out this run: the
+                // vertices shaded for it go no further
+                Err(error) if error == gles::LEFT_OUT => return 0,
                 Err(error) if first_time(&error) => log::error!("the GPU could not draw, {error}, drawing in software"),
                 Err(_) => {}
             }

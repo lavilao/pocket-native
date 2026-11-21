@@ -38,7 +38,7 @@ use programs::*;
 use sources::*;
 pub use display::{layout_scale, layout_size, panel_timing, second_window, set_second_shows_top, set_second_stretched, set_second_window, set_stacked, set_top_crop, set_window, stacked};
 pub use programs::{compiling, compiling_stand_ins, note_compiler_crash, preparing, shader_compiles, skip_preparing, waited_draws};
-pub(crate) use programs::{COMPILING, WAITED};
+pub(crate) use programs::{COMPILING, LEFT_OUT, WAITED};
 
 const VERTEX_SIZE: usize = 24 * 4;
 const PROCTEX_WORDS: usize = 8;
@@ -2930,7 +2930,15 @@ impl Gles {
         };
         let compiled = if crate::fast_with(crate::speedup::PLAIN_MATH) { plain_multiplies(&vertex_source) } else { vertex_source };
         if [fnv(&[&compiled]), fnv(&[&fragment]), fnv(&[&compiled, &fragment])].iter().any(|fingerprint| self.crashed.contains(fingerprint)) {
-            return Err("the driver crashed on its program before".to_owned());
+            // the driver's compiler died on this program in an earlier run:
+            // what the draws do instead is ZAKURO_CRASHED_SHADERS' to say. A
+            // stand-in pair already is the stand-in, so it goes to the CPU
+            // rather than call itself again
+            return match crashed_shaders() {
+                programs::Crashed::StandIn if constants[29] == 0 => self.program(&generic_constants(constants), writes_depth, &[], vertex, true, None),
+                programs::Crashed::Skip => Err(LEFT_OUT.to_owned()),
+                _ => Err("the driver crashed on its program before".to_owned()),
+            };
         }
         let cached = program_cache_path(&self.name, &compiled, &fragment);
         if let Some(inputs) = inputs {
