@@ -2436,7 +2436,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-native"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "env_logger",
  "libc",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-native-android"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "android-activity",
  "jni 0.21.1",
@@ -2464,7 +2464,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-native-kit"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "eframe",
  "rfd",
@@ -2630,14 +2630,14 @@ dependencies = [
 
 [[package]]
 name = "recomp-abi"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "libloading",
 ]
 
 [[package]]
 name = "recomp3ds"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "recomp-abi",
  "zakuro-cpu",
@@ -4118,7 +4118,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "zakuro-common"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bitflags 2.13.2",
  "log",
@@ -4127,7 +4127,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bitflags 2.13.2",
  "chrono",
@@ -4147,7 +4147,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-cpu"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "log",
  "zakuro-common",
@@ -4155,7 +4155,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-fs"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "log",
  "thiserror 2.0.20",
@@ -4164,7 +4164,7 @@ dependencies = [
 
 [[package]]
 name = "zakuro-gpu"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bitflags 2.13.2",
  "cityhasher",
