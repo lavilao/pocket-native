@@ -1,5 +1,4 @@
-//! a title made into a program of its own, its recompiled code linked in
-//! and Zakuro running everything around it.
+//! a title turned into its own program, its recompiled code linked in and zakuro running everything around it
 
 use std::path::Path;
 
@@ -60,10 +59,12 @@ use std::ptr::addr_of;
 
 extern "C" {
     static recomp_abi: u32;
+    static recomp_generation: u32;
     static recomp_entry_count: u32;
     static recomp_entries: u8;
     static recomp_module_count: u32;
     static recomp_modules: u8;
+    static recomp_origins: u8;
 }
 
 fn main() {
@@ -77,12 +78,14 @@ fn main() {
             addr_of!(recomp_modules) as *const c_void,
             recomp_module_count,
         )
+        // so that functions a mod or an update changed run in the interpreter
+        .with_origins(recomp_generation, addr_of!(recomp_origins) as *const c_void)
     };
     zakuro::run(Some(code));
 }
 "#;
 
-/// a name Cargo takes for the program, from the title's.
+/// a cargo friendly program name from the title's
 pub fn package_name(title: &str) -> String {
     let name: String = title
         .chars()
@@ -92,9 +95,8 @@ pub fn package_name(title: &str) -> String {
     if name.is_empty() { "title".to_owned() } else { name.to_owned() }
 }
 
-/// writes a Cargo project at dir whose program runs the title, with the code
-/// build left in dir/code/librecomp.a. zakuro is a checkout to build against
-/// instead of the one on GitHub.
+/// writes a cargo project at dir whose program runs the title, w/ the built code left in dir/code/librecomp.a
+/// zakuro is a checkout to build against instead of the github one
 pub fn write_project(dir: &Path, name: &str, title: &str, program_id: u64, zakuro: Option<&Path>) -> Result<(), String> {
     let dependency = match zakuro {
         Some(path) => {
