@@ -53,7 +53,7 @@ pub fn generate(
     events: &(dyn Fn(Event) + Sync),
 ) -> Result<Generated, String> {
     let title = Title::load(rom).map_err(|error| format!("could not load {}, {error}", rom.display()))?;
-    let mut programs = crate::programs(&title).map_err(|error| format!("could not read the code, {error}"))?;
+    let mut programs = crate::programs(&title, crate::Mods::default()).map_err(|error| format!("could not read the code, {error}"))?;
     let dir = pick(&title);
     let files = match overrides {
         Some(path) => overrides::load(path)?,

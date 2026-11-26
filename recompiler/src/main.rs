@@ -13,7 +13,7 @@ use std::process::exit;
 use recomp3ds::build::{self, Event};
 use recomp3ds::discover::{self, Analysis, Byte, Mode, Program, Source};
 use recomp3ds::rom::Title;
-use recomp3ds::{compile, port};
+use recomp3ds::{compile, port, Mods};
 #[cfg(feature = "verify")]
 use recomp3ds::{abi, codegen, image, imported, module_files, static_module, verify};
 
@@ -97,7 +97,7 @@ fn load(path: &str) -> (Title, Vec<(String, Program)>) {
         eprintln!("could not load {path}, {error}");
         exit(1);
     });
-    let programs = recomp3ds::programs(&title).unwrap_or_else(|error| {
+    let programs = recomp3ds::programs(&title, Mods::default()).unwrap_or_else(|error| {
         eprintln!("could not read the code, {error}");
         exit(1);
     });
@@ -193,8 +193,8 @@ fn check(path: &str, library: &Path, count: usize) {
     print_report("executable", &executable);
 
     let mut modules = verify::Report::default();
-    let files = module_files(&title);
-    let crs = static_module(&title);
+    let files = module_files(&title, Mods::default());
+    let crs = static_module(&title, Mods::default());
     for (module, bytes) in &files {
         let Some(index) = library.module_index(&module.name) else { continue };
         let Some(program) = module.program(bytes, &imported(&files, crs.as_ref(), module)) else { continue };
