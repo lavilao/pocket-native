@@ -19,7 +19,7 @@ pub mod vulkan;
 
 use format::ColorFormat;
 use registers::*;
-pub use overlay::{fitted, Overlay, OverlayMesh, OverlayTexture, OverlayVertex};
+pub use overlay::{cursor_marks, fitted, Overlay, OverlayMesh, OverlayTexture, OverlayVertex};
 pub use renderer::{DrawCall, Renderer, SoftwareRenderer};
 #[cfg(feature = "gles")]
 pub use raster::gles::{compiling, compiling_stand_ins, preparing, skip_preparing, waited_draws, layout_scale, layout_size, note_compiler_crash, panel_timing, second_window, set_drops, set_second_shows_top, set_second_stretched, set_second_window, set_stacked, set_top_crop, shader_compiles, stacked};
@@ -1093,15 +1093,14 @@ impl Gpu {
     /// area, left, top, width and height in the panel's pixels, the overlays
     /// over them, the top screen filtered when smooth and a picture halfway
     /// between its last two shown first when interpolating. the Vulkan
-    /// presenter takes the screens and the overlays, and leaves the cursor
-    /// to GLES.
+    /// presenter takes the same screens, overlays and cursor.
     pub fn present_panel(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], cursor: Option<(i32, i32)>, overlays: Vec<std::sync::Arc<Overlay>>, smooth: bool, interpolate: bool, frames: u32) {
-        // the Vulkan presenter takes the screens and the menu over them; the
-        // touch cursor is GLES's own and is left out
+        // the Vulkan presenter takes the screens, the menu over them and the
+        // touch cursor
         #[cfg(feature = "vulkan")]
         if let Some(presenter) = self.presenter.as_mut() {
-            let _ = (cursor, interpolate, frames);
-            presenter.present(shown, smooth, overlays);
+            let _ = (interpolate, frames);
+            presenter.present(shown, smooth, overlays, cursor);
             return;
         }
         #[cfg(feature = "gles")]

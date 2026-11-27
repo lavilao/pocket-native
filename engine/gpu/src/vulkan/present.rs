@@ -32,8 +32,13 @@ const SCREEN_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const UNIFORM_BYTES: u64 = 32;
 /// an overlay corner: its place in clip space, its uv and its colour.
 const CORNER_STRIDE: u64 = 20;
-/// the sets the overlay's textures get: a menu's few, with room to spare.
-const OVERLAY_SETS: u32 = 64;
+/// the sets the menu's first pool is made for: a menu's few, with room to
+/// spare. every one taken makes another pool twice the size, so no number of
+/// textures runs out.
+const OVERLAY_SETS: u32 = 16;
+/// the id the touch cursor's one white pixel is kept under, which no overlay
+/// the frontend sends uses.
+const CURSOR_TEXTURE: u64 = u64::MAX;
 
 /// the shaders, WGSL turned into SPIR-V by naga when the presenter is made.
 const SHADERS: &str = r#"
@@ -178,7 +183,67 @@ struct Picture {
     view: vk::ImageView,
     sampler: vk::Sampler,
     set: vk::DescriptorSet,
+    /// the pool the set came from, whose room it gives back when the texture
+    /// goes.
+    pool: usize,
     size: [u32; 2],
+}
+
+/// the sets the menu's textures take: a pool made for so many, and one more
+/// pool, twice the size, when they are all taken. a set a dropped texture
+/// gives back is taken up again, so a session's textures never run out and the
+/// pools stop growing once the churn settles.
+struct SetBudget {
+    /// the sets the first pool is made for.
+    first: u32,
+    /// each pool's sets and how many of them are taken.
+    pools: Vec<(u32, u32)>,
+}
+
+impl SetBudget {
+    fn new(first: u32) -> SetBudget {
+        SetBudget { first: first.max(1), pools: Vec::new() }
+    }
+
+    /// the pool the next set is taken from, making one when every pool is
+    /// full.
+    fn take(&mut self) -> usize {
+        match self.pools.iter().position(|(capacity, taken)| taken < capacity) {
+            Some(pool) => {
+                self.pools[pool].1 += 1;
+                pool
+            }
+            None => {
+                let capacity = match self.pools.last() {
+                    Some((capacity, _)) => capacity.saturating_mul(2).max(self.first),
+                    None => self.first,
+                };
+                self.pools.push((capacity, 1));
+                self.pools.len() - 1
+            }
+        }
+    }
+
+    /// a set of a pool given back, for the next take to use.
+    fn give(&mut self, pool: usize) {
+        if let Some((capacity, taken)) = self.pools.get_mut(pool) {
+            *taken = taken.saturating_sub(1).min(*capacity);
+        }
+    }
+
+    /// what a pool was made for.
+    fn capacity(&self, pool: usize) -> Option<u32> {
+        self.pools.get(pool).map(|(capacity, _)| *capacity)
+    }
+
+    /// how many of a pool's sets are taken.
+    fn taken(&self, pool: usize) -> Option<u32> {
+        self.pools.get(pool).map(|(_, taken)| *taken)
+    }
+
+    fn pools(&self) -> usize {
+        self.pools.len()
+    }
 }
 
 /// one mesh of an overlay as this frame draws it: where its indices start in
@@ -221,9 +286,12 @@ pub struct Presenter {
     pipeline: vk::Pipeline,
     /// the menu's pipeline: the same pass and layout, blended over the screens.
     overlay_pipeline: vk::Pipeline,
-    /// the sets the overlay's texture goes through.
-    overlay_pool: vk::DescriptorPool,
+    /// the pools the menu's textures take their sets from, made as they fill.
+    overlay_pools: Vec<vk::DescriptorPool>,
+    overlay_budget: SetBudget,
     overlay_textures: HashMap<u64, Picture>,
+    /// the set the touch cursor's white pixel is bound through.
+    cursor_set: vk::DescriptorSet,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     // a frame's own set a screen, so a frame being recorded never rewrites the
@@ -334,8 +402,10 @@ impl Presenter {
             pipeline: vk::Pipeline::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             overlay_pipeline: vk::Pipeline::null(),
-            overlay_pool: vk::DescriptorPool::null(),
+            overlay_pools: Vec::new(),
+            overlay_budget: SetBudget::new(OVERLAY_SETS),
             overlay_textures: HashMap::new(),
+            cursor_set: vk::DescriptorSet::null(),
             overlay_vertices: std::array::from_fn(|_| Staging::empty()),
             overlay_indices: std::array::from_fn(|_| Staging::empty()),
             overlay_draws: std::array::from_fn(|_| Vec::new()),
@@ -372,7 +442,6 @@ impl Presenter {
         self.pipeline_layout = unsafe { create_pipeline_layout(&device, self.descriptor_layout) }?;
         self.pipeline = unsafe { create_pipeline(&device, self.pipeline_layout, self.render_pass) }?;
         self.overlay_pipeline = unsafe { create_overlay_pipeline(&device, self.pipeline_layout, self.render_pass) }?;
-        self.overlay_pool = unsafe { create_overlay_pool(&device) }?;
         self.nearest = unsafe { create_sampler(&device, false) }?;
         self.linear = unsafe { create_sampler(&device, true) }?;
         let (pool, sets) = unsafe { create_descriptors(&device, self.descriptor_layout) }?;
@@ -409,6 +478,30 @@ impl Presenter {
             let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None) }
                 .map_err(|error| format!("no Vulkan fence: {error}"))?;
             self.fences.push(fence);
+        }
+        // one white pixel, for the touch cursor's squares
+        // SAFETY: an image, a view and a sampler of this device, a set of the
+        // pool this call makes, and a copy into the image before any frame
+        // samples it
+        unsafe {
+            let (image, memory) = create_screen_image(&device, &self.instance, self.physical, 1, 1)?;
+            let view = create_view(&device, image, SCREEN_FORMAT)?;
+            let sampler = create_sampler(&device, false)?;
+            let (set, pool) = self.overlay_set(view, sampler)?;
+            upload_overlay(
+                &device,
+                &self.instance,
+                self.physical,
+                self.command_pool,
+                self.queue,
+                image,
+                true,
+                [1, 1],
+                [0, 0],
+                &[255, 255, 255, 255],
+            )?;
+            self.cursor_set = set;
+            self.overlay_textures.insert(CURSOR_TEXTURE, Picture { image, memory, view, sampler, set, pool, size: [1, 1] });
         }
         self.make_framebuffers()
     }
@@ -521,13 +614,13 @@ impl Presenter {
     /// puts a frame's screens, and the menu over them, on the window. a frame
     /// the window will not take yet is dropped; the next one draws into a
     /// swapchain made for its size.
-    pub fn present(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], smooth: bool, overlays: Vec<Arc<Overlay>>) {
-        if let Err(error) = self.draw(shown, smooth, overlays) {
+    pub fn present(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], smooth: bool, overlays: Vec<Arc<Overlay>>, cursor: Option<(i32, i32)>) {
+        if let Err(error) = self.draw(shown, smooth, overlays, cursor) {
             log::error!("Vulkan could not show a frame, {error}");
         }
     }
 
-    fn draw(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], smooth: bool, overlays: Vec<Arc<Overlay>>) -> Result<(), String> {
+    fn draw(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], smooth: bool, overlays: Vec<Arc<Overlay>>, cursor: Option<(i32, i32)>) -> Result<(), String> {
         let device = self.device.clone();
         let frame = self.frame;
         // nothing this frame touches may still be in the GPU's hands: the
@@ -542,7 +635,7 @@ impl Presenter {
         }
         self.stage(shown, frame)?;
         self.update_uniforms(smooth, frame);
-        self.stage_overlays(&overlays, frame);
+        self.stage_overlays(&overlays, frame, cursor);
 
         // SAFETY: an acquire on the swapchain and the frame's semaphore
         let acquired = unsafe { self.swapchain_fn.acquire_next_image(self.swapchain, u64::MAX, self.available[frame], vk::Fence::null()) };
@@ -819,7 +912,7 @@ impl Presenter {
 
     /// the menu's textures onto the device, and its meshes into this frame's
     /// corners and indices, placed where the layout puts them.
-    fn stage_overlays(&mut self, overlays: &[Arc<Overlay>], frame: usize) {
+    fn stage_overlays(&mut self, overlays: &[Arc<Overlay>], frame: usize, cursor: Option<(i32, i32)>) {
         self.overlay_draws[frame].clear();
         if overlays.is_empty() {
             return;
@@ -843,6 +936,27 @@ impl Presenter {
         let mut corners: Vec<Corner> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         let mut draws: Vec<OverlayDraw> = Vec::new();
+        // the touch cursor, where GLES puts it and as big: a darker square with
+        // a lighter one inside, the two marks cursor_marks gives
+        if let Some((x, y)) = cursor {
+            if self.cursor_set != vk::DescriptorSet::null() {
+                let to = |value: i32| (left + value as f32 * scale).round() as i32;
+                for (size, shade) in crate::cursor_marks(scale) {
+                    let [x0, y0, wide, tall] = cursor_rect(to(x), to(y), size);
+                    let Some(scissor) = scissor_of([0, 0, self.extent.width, self.extent.height], [x0, y0, wide, tall], 1.0, 1.0, self.extent) else { continue };
+                    let light = (shade * 255.0) as u8;
+                    let colour = [light, light, light, 255];
+                    let vertex_offset = corners.len() as i32;
+                    let (x1, y1) = (x0 + wide, y0 + tall);
+                    for (px, py) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+                        corners.push(Corner { position: [2.0 * px / width - 1.0, 2.0 * py / height - 1.0], uv: [0.5, 0.5], color: colour });
+                    }
+                    let first = indices.len() as u32;
+                    indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                    draws.push(OverlayDraw { first, count: 6, vertex_offset, set: self.cursor_set, scissor });
+                }
+            }
+        }
         for overlay in overlays {
             let mut sets: HashMap<u64, vk::DescriptorSet> = HashMap::new();
             for texture in &overlay.textures {
@@ -855,8 +969,16 @@ impl Presenter {
             }
             for id in &overlay.free {
                 if let Some(picture) = self.overlay_textures.remove(id) {
-                    // SAFETY: the device was let finish above
-                    unsafe { destroy_picture(&device, picture) };
+                    let pool = picture.pool;
+                    // SAFETY: the device was let finish above, so no frame reads
+                    // the set, and a pool outlives every set it made
+                    unsafe {
+                        if let Some(handle) = self.overlay_pools.get(pool) {
+                            let _ = device.free_descriptor_sets(*handle, &[picture.set]);
+                        }
+                        destroy_picture(&device, picture);
+                    }
+                    self.overlay_budget.give(pool);
                 }
             }
             // where the overlay's space sits in the window: over the bottom
@@ -926,9 +1048,16 @@ impl Presenter {
             Some((set, size)) if texture.offset.is_some() || size == texture.size => (set, false),
             _ => {
                 if let Some(old) = self.overlay_textures.remove(&texture.id) {
+                    let pool = old.pool;
                     // SAFETY: the device was let finish before this frame's
-                    // overlays were staged
-                    unsafe { destroy_picture(&device, old) };
+                    // overlays were staged, so no frame reads the set
+                    unsafe {
+                        if let Some(handle) = self.overlay_pools.get(pool) {
+                            let _ = device.free_descriptor_sets(*handle, &[old.set]);
+                        }
+                        destroy_picture(&device, old);
+                    }
+                    self.overlay_budget.give(pool);
                 }
                 let [width, height] = texture.size;
                 // SAFETY: an image and a view of this device, a sampler, and a
@@ -936,8 +1065,8 @@ impl Presenter {
                 let (image, memory) = unsafe { create_screen_image(&device, &self.instance, self.physical, width.max(1), height.max(1)) }?;
                 let view = unsafe { create_view(&device, image, SCREEN_FORMAT) }?;
                 let sampler = unsafe { create_sampler(&device, texture.linear) }?;
-                let set = unsafe { self.overlay_set(view, sampler) }?;
-                self.overlay_textures.insert(texture.id, Picture { image, memory, view, sampler, set, size: texture.size });
+                let (set, pool) = unsafe { self.overlay_set(view, sampler) }?;
+                self.overlay_textures.insert(texture.id, Picture { image, memory, view, sampler, set, pool, size: texture.size });
                 (set, true)
             }
         };
@@ -965,13 +1094,23 @@ impl Presenter {
         Ok(set)
     }
 
-    /// a new set with a texture and its sampler in it.
-    unsafe fn overlay_set(&self, view: vk::ImageView, sampler: vk::Sampler) -> Result<vk::DescriptorSet, String> {
+    /// a new set with a texture and its sampler in it, and the pool it came
+    /// from: one of those made, or one more when they are all taken.
+    unsafe fn overlay_set(&mut self, view: vk::ImageView, sampler: vk::Sampler) -> Result<(vk::DescriptorSet, usize), String> {
+        let device = self.device.clone();
+        let pool = self.overlay_budget.take();
+        if pool == self.overlay_pools.len() {
+            let capacity = self.overlay_budget.capacity(pool).unwrap_or(OVERLAY_SETS);
+            // SAFETY: another pool of this device, for the sets the menu's
+            // textures take
+            let made = unsafe { create_overlay_pool(&device, capacity) }?;
+            self.overlay_pools.push(made);
+        }
+        let handle = self.overlay_pools[pool];
         let layouts = [self.descriptor_layout];
-        // SAFETY: a set of the pool this presenter made, of a layout it takes
+        // SAFETY: a set of a pool this presenter made, of a layout it takes
         let set = unsafe {
-            self.device
-                .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.overlay_pool).set_layouts(&layouts))
+            device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(handle).set_layouts(&layouts))
         }
         .map_err(|error| format!("no Vulkan descriptor set for a menu texture: {error}"))?;
         let set = set[0];
@@ -990,8 +1129,8 @@ impl Presenter {
                 .image_info(&picture_info),
         ];
         // SAFETY: a set of this presenter's, before any frame binds it
-        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
-        Ok(set)
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        Ok((set, pool))
     }
 
     /// lets everything go: the frames in flight first, then the objects in the
@@ -1042,8 +1181,8 @@ impl Presenter {
         for (_, picture) in self.overlay_textures.drain() {
             unsafe { destroy_picture(&device, picture) };
         }
-        if self.overlay_pool != vk::DescriptorPool::null() {
-            unsafe { device.destroy_descriptor_pool(self.overlay_pool, None) };
+        for pool in self.overlay_pools.drain(..) {
+            unsafe { device.destroy_descriptor_pool(pool, None) };
         }
         if self.overlay_pipeline != vk::Pipeline::null() {
             unsafe { device.destroy_pipeline(self.overlay_pipeline, None) };
@@ -1090,6 +1229,12 @@ impl Uniform {
     fn empty() -> Uniform {
         Uniform { buffer: vk::Buffer::null(), memory: vk::DeviceMemory::null(), mapped: std::ptr::null_mut() }
     }
+}
+
+/// where a cursor mark of a size sits over a spot, its centre on the spot and
+/// its left and top whole pixels, as GLES cuts it.
+fn cursor_rect(x: i32, y: i32, size: i32) -> [f32; 4] {
+    [(x - size / 2) as f32, (y - size / 2) as f32, size as f32, size as f32]
 }
 
 /// where a mesh's clip sits in the window, cut to it, or nothing if none of
@@ -1157,14 +1302,14 @@ unsafe fn destroy_picture(device: &ash::Device, picture: Picture) {
 
 /// the pool the menu's textures get their sets from, of the layout the screens
 /// use: a sampler and a sampled picture.
-unsafe fn create_overlay_pool(device: &ash::Device) -> Result<vk::DescriptorPool, String> {
+unsafe fn create_overlay_pool(device: &ash::Device, size: u32) -> Result<vk::DescriptorPool, String> {
     let sizes = [
-        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLER).descriptor_count(OVERLAY_SETS),
-        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(OVERLAY_SETS),
-        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(OVERLAY_SETS),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLER).descriptor_count(size),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(size),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(size),
     ];
     // SAFETY: a pool of this device for the sets the menu's textures take
-    unsafe { device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(OVERLAY_SETS).pool_sizes(&sizes), None) }
+    unsafe { device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(size).pool_sizes(&sizes), None) }
         .map_err(|error| format!("no Vulkan descriptor pool for the menu: {error}"))
 }
 
@@ -1902,5 +2047,44 @@ mod tests {
         let cut = scissor_of([600, 460, 700, 500], rect, 1.0, 1.0, extent).expect("its top left corner shows");
         assert_eq!((cut.offset.x, cut.offset.y, cut.extent.width, cut.extent.height), (600, 460, 40, 20));
         assert!(scissor_of([700, 500, 800, 600], rect, 1.0, 1.0, extent).is_none());
+    }
+
+    /// a cursor's marks sit centred on the finger's spot, as GLES cuts them.
+    #[test]
+    fn the_cursor_sits_on_its_spot() {
+        assert_eq!(cursor_rect(100, 50, 7), [97.0, 47.0, 7.0, 7.0]);
+        assert_eq!(cursor_rect(10, 10, 15), [3.0, 3.0, 15.0, 15.0]);
+    }
+
+    /// the menu's sets make more pools rather than run out, and a set a
+    /// dropped texture gives back is taken up again.
+    #[test]
+    fn the_sets_grow_and_are_reused() {
+        let mut budget = SetBudget::new(4);
+        for _ in 0..100 {
+            budget.take();
+        }
+        assert_eq!(budget.taken(0), Some(4), "the first pool filled");
+        assert!(budget.pools() > 1, "another pool was made");
+        for pool in 0..budget.pools() {
+            let capacity = budget.capacity(pool).expect("a pool was made");
+            assert!(budget.taken(pool).expect("a pool was made") <= capacity, "a pool gave out more than it holds");
+        }
+
+        let mut budget = SetBudget::new(2);
+        let first = budget.take();
+        budget.take();
+        let pools = budget.pools();
+        budget.give(first);
+        assert_eq!(budget.take(), first, "the pool with room is taken again");
+        assert_eq!(budget.pools(), pools, "no pool was added");
+
+        // churn settles: taking and giving never grows past one pool
+        let mut budget = SetBudget::new(2);
+        for _ in 0..50 {
+            let pool = budget.take();
+            budget.give(pool);
+        }
+        assert_eq!(budget.pools(), 1);
     }
 }

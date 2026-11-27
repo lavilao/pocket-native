@@ -17,6 +17,14 @@ pub struct Overlay {
     pub bottom: bool,
 }
 
+/// the touch cursor's two squares: how wide each is at a given scale, and how
+/// light, from the darker one under to the lighter one over. GLES cuts the
+/// window to these and clears them; a Vulkan presenter draws them as squares.
+/// either way the size is odd, so a finger's mark sits square on its spot.
+pub fn cursor_marks(scale: f32) -> [(i32, f32); 2] {
+    [(7, 0.0), (5, 1.0)].map(|(size, shade)| ((size as f32 * scale) as i32 | 1, shade))
+}
+
 /// where 640x480 sits fitted into an area of the layout, centred: left, top
 /// and how many times over.
 pub fn fitted([left, top, width, height]: [i32; 4]) -> (f32, f32, f32) {
@@ -55,4 +63,21 @@ pub struct OverlayMesh {
     pub clip: [u32; 4],
     pub vertices: Vec<OverlayVertex>,
     pub indices: Vec<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// the marks keep the sizes GLES has always drawn, odd at any scale.
+    #[test]
+    fn the_cursor_marks_are_odd_and_grow_with_the_scale() {
+        assert_eq!(cursor_marks(1.0), [(7, 0.0), (5, 1.0)]);
+        assert_eq!(cursor_marks(2.0), [(15, 0.0), (11, 1.0)]);
+        for scale in [0.5, 1.0, 1.5, 2.0, 3.0] {
+            for (size, _) in cursor_marks(scale) {
+                assert_eq!(size % 2, 1, "{size} at {scale}x is even");
+            }
+        }
+    }
 }

@@ -1057,7 +1057,7 @@ pub(super) unsafe fn draw_parts(
                     Part::Cursor { x, y } => {
                         let (x, y) = (fit.x(x), fit.y(y));
                         gl.enable(glow::SCISSOR_TEST);
-                        for (size, shade) in [(7, 0.0), (5, 1.0)].map(|(size, shade)| ((size as f32 * fit.scale) as i32 | 1, shade)) {
+                        for (size, shade) in crate::cursor_marks(fit.scale) {
                             gl.scissor(x - size / 2, height - y - size / 2, size, size);
                             gl.clear_color(shade, shade, shade, 1.0);
                             gl.clear(glow::COLOR_BUFFER_BIT);
