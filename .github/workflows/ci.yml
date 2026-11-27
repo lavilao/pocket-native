@@ -1,7 +1,7 @@
 # builds and tests the whole workspace, the GPU tests skip themselves on a
-# runner without OpenGL ES, and cross-builds the Android app's 64-bit
-# library. the 32-bit build is a workflow of its own, ci-32bit.yml, so it
-# can be run and its artifact picked up without waiting for this one.
+# runner without OpenGL ES. the Android app is built 32-bit only, in a
+# workflow of its own, ci-32bit.yml, so it can be run and its artifact picked
+# up without waiting for these tests.
 name: CI
 
 on:
@@ -20,23 +20,3 @@ jobs:
       # both GPU backends compiled and their tests run, the Vulkan one here
       # and never in the app's own build
       - run: cargo test --release --locked --workspace --features zakuro-gpu/gles,zakuro-gpu/vulkan
-
-  # cross-builds the Android app's library with the runner's NDK, so the
-  # Android port keeps building
-  android:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
-      - run: rustup target add aarch64-linux-android
-      - name: build pocket-native-android for aarch64-linux-android
-        run: |
-          bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$bin/aarch64-linux-android30-clang"
-          export CC_aarch64_linux_android="$bin/aarch64-linux-android30-clang"
-          export AR_aarch64_linux_android="$bin/llvm-ar"
-          cargo build --release --locked --target aarch64-linux-android -p pocket-native-android
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pocket-native-android-aarch64
-          path: target/aarch64-linux-android/release/*.so
