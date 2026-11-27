@@ -19,11 +19,11 @@ this one — that these live:
 
 so none of that is in this tree, whatever a commit message claims. the
 Vulkan work here is the fork's own, in `engine/gpu/src/vulkan/`: a 1.1
-device, and a presenter that puts the software rasterizer's screens on the
-window through a 1.1 surface and swapchain. `ZAKURO_GPU=vulkan` picks it, and
-then GLES does not start at all: the 3D is drawn on the CPU, and the menu's
-GLES overlays are not drawn yet. upstream's own renderer, the one that draws
-the 3D on the GPU, is still the gap above.
+device, and a presenter that puts the software rasterizer's screens and the
+menu over them on the window through a 1.1 surface and swapchain. the menu's
+`Show screens with` setting picks it, and then GLES does not start at all: the
+3D is drawn on the CPU and Vulkan shows the pictures. upstream's own renderer,
+the one that draws the 3D on the GPU, is still the gap above.
 
 ## how the two lines meet
 

@@ -86,7 +86,7 @@ use crate::font::{Canvas, Font};
 use crate::input::{Pad, B, FN, L1, L2, L3, R1, R2, R3, SELECT, START};
 use crate::menu::{Action, Menu, Status};
 use crate::profile::Profile;
-use crate::settings::{Advanced, Cursor, Dpad, GameSettings, Layout, Power, RightStick, Rotation, Settings};
+use crate::settings::{Advanced, Cursor, Dpad, GameSettings, Layout, Power, Presenter, RightStick, Rotation, Settings};
 
 /// the exit code that asks the launcher to start the game again.
 const RESET: i32 = 3;
@@ -214,6 +214,7 @@ pub fn run(mut args: Vec<String>) {
         recompiled: std::env::var("ZAKURO_RECOMPILED").ok().filter(|_| advanced.recompiled).map(Into::into),
         hardware_renderer: true,
         software_draws: !advanced.gpu_drawing,
+        vulkan: settings.presenter == Presenter::Vulkan,
         data_dir: Some(data.clone()),
         language: game.language,
         region: game.region,

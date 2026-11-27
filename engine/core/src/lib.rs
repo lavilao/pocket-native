@@ -55,6 +55,10 @@ pub struct Config {
     /// with hardware_renderer, the host's GPU only showing the screens, the
     /// software rasterizer drawing them.
     pub software_draws: bool,
+    /// show the software rasterizer's screens through Vulkan 1.1 rather than
+    /// OpenGL ES, as the menu's presenter setting asks. GLES does not start
+    /// while it holds, and a Vulkan that cannot start leaves GLES to it.
+    pub vulkan: bool,
     /// how many times the console's resolution the host's GPU draws at, in
     /// quarters from 1 to 4.
     pub resolution: f32,
@@ -81,6 +85,7 @@ impl Default for Config {
             data_dir: None,
             hardware_renderer: false,
             software_draws: false,
+            vulkan: false,
             resolution: 1.0,
             dlc: Vec::new(),
             clock: None,

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use crate::font::{rgba, Canvas};
 use crate::input::{A, B, DOWN, LEFT, MAPPED, RIGHT, UP};
 use crate::profile::Profile;
-use crate::settings::{Advanced, Aspect, Buttons, Cursor, Dpad, GameSettings, Key, Layout, Power, RightStick, Rotation, Settings, Speed, Stick, Stretch};
+use crate::settings::{Advanced, Aspect, Buttons, Cursor, Dpad, GameSettings, Key, Layout, Power, Presenter, RightStick, Rotation, Settings, Speed, Stick, Stretch};
 
 const PANEL: [u8; 3] = [13, 20, 32];
 const EDGE: [u8; 3] = [40, 110, 210];
@@ -36,6 +36,7 @@ enum Field {
     Rotation,
     FrameCap,
     Power,
+    Presenter,
     Option(usize),
     TouchSpeed,
     Cursor,
@@ -184,7 +185,7 @@ fn sections(page: Page, profile: &Profile) -> Vec<(&'static str, Vec<Field>)> {
     let only = |fields: Vec<Field>| fields.into_iter().filter(|&field| useful(field)).collect();
     match page {
         Page::Main => vec![
-            ("Display", only(vec![Field::Layout, Field::Aspect, Field::Resolution, Field::Smooth, Field::Stretch, Field::Interpolate, Field::ShowFps, Field::ShowClock, Field::ShowBuilding, Field::ShowSaving, Field::Rotation])),
+            ("Display", only(vec![Field::Layout, Field::Aspect, Field::Resolution, Field::Smooth, Field::Stretch, Field::Interpolate, Field::ShowFps, Field::ShowClock, Field::ShowBuilding, Field::ShowSaving, Field::Rotation, Field::Presenter])),
             ("Performance", only(vec![Field::FrameCap, Field::Power])),
             ("This game", (0..profile.options.len()).map(Field::Option).collect()),
             ("Controls", only(vec![Field::TouchSpeed, Field::Cursor, Field::Buttons, Field::LeftStick, Field::Dpad, Field::RightStick, Field::ReverseTiltX, Field::ReverseTiltY, Field::TouchControls, Field::EditControls, Field::Mapping])),
@@ -258,6 +259,14 @@ fn label(field: Field, settings: &Settings, game: &GameSettings, profile: &Profi
             ("Rotation", rotation.into())
         }
         Field::FrameCap => ("Frame cap", format!("{} fps", settings.frame_cap)),
+        Field::Presenter => (
+            "Show screens with",
+            match settings.presenter {
+                Presenter::OpenGlEs => "OpenGL ES",
+                Presenter::Vulkan => "Vulkan",
+            }
+            .into(),
+        ),
         Field::Power => ("Power", format!("{:?}", settings.power)),
         Field::Option(index) => {
             let option = &profile.options[index];
@@ -333,6 +342,7 @@ fn change(field: Field, by: isize, settings: &mut Settings, game: &mut GameSetti
         Field::ShowSaving => settings.show_saving = !settings.show_saving,
         Field::Rotation => settings.rotation = step(&[Rotation::Auto, Rotation::Clockwise, Rotation::CounterClockwise, Rotation::Off], settings.rotation, by),
         Field::FrameCap => settings.frame_cap = step(&CAPS, settings.frame_cap, by),
+        Field::Presenter => settings.presenter = step(&Presenter::ALL, settings.presenter, by),
         Field::Power => settings.power = step(&[Power::Saver, Power::Balanced, Power::Performance], settings.power, by),
         Field::Option(index) => {
             let option = &profile.options[index];
@@ -391,6 +401,7 @@ fn help(field: Field, profile: &Profile) -> &str {
         Field::ShowSaving => "The word in the top right corner while the game saves, to leave the power on. Off hides it.",
         Field::Rotation => "Turns the picture for a screen that shows it the wrong way round. Takes effect when the game starts again.",
         Field::FrameCap => "The most pictures shown a second. Lower lasts longer and runs cooler.",
+        Field::Presenter => "OpenGL ES draws with the handheld's GPU. Vulkan shows the software-drawn screens itself, for a driver whose shader compiler crashes. Restart the game for it.",
         Field::Power => "How fast the CPU and GPU run. Performance is fastest and warmest, Saver lasts longest.",
         Field::Option(index) => &profile.options[index].help,
         Field::TouchSpeed => "How fast the right stick moves the touch cursor. R2 or R3 touches.",

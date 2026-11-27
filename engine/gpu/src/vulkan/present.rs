@@ -1,21 +1,25 @@
-//! the screens on a Vulkan 1.1 swapchain.
+//! the screens and the menu on a Vulkan 1.1 swapchain.
 //!
 //! the engine draws the 3D in software and hands this the pictures it made —
 //! the same `PanelImage::Pixels` an OpenGL ES presenter gets — and this puts
 //! them on the window: instance, surface, device, swapchain, one render pass
 //! with a colour attachment, a pipeline, a descriptor set a screen, classic
-//! barriers, semaphores and fences, present.
+//! barriers, semaphores and fences, present. the menu and the boxes over the
+//! screens come as the `Overlay` meshes GLES draws, and go in the same pass
+//! through a second pipeline that blends them over the screens.
 //!
 //! nothing here is Vulkan 1.3: the uniform block and the sampled picture are
 //! ordinary descriptor set bindings (no push descriptors), a real render pass
 //! does the colour attachment's layout transitions (no dynamic rendering),
 //! and the barriers are vkCmdPipelineBarrier, not its 2 form.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::Arc;
 
 use ash::vk;
 
-use crate::PanelImage;
+use crate::{Overlay, OverlayTexture, PanelImage};
 
 /// frames the CPU may get ahead of the GPU, each with its own commands, its
 /// fence and its acquire semaphore.
@@ -26,6 +30,10 @@ const FORMATS: [vk::Format; 3] = [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8
 const SCREEN_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 /// a uniform block is two vec4: the quad's place and the picture's uv.
 const UNIFORM_BYTES: u64 = 32;
+/// an overlay corner: its place in clip space, its uv and its colour.
+const CORNER_STRIDE: u64 = 20;
+/// the sets the overlay's textures get: a menu's few, with room to spare.
+const OVERLAY_SETS: u32 = 64;
 
 /// the shaders, WGSL turned into SPIR-V by naga when the presenter is made.
 const SHADERS: &str = r#"
@@ -66,6 +74,50 @@ fn fs(in: FsIn) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// the overlay's shaders: the corners come in as clip space already, so the
+/// vertex stage passes them and the picture's uv along, and the fragment one
+/// blends the picture's premultiplied colour with the corner's.
+const OVERLAY_SHADERS: &str = r#"
+@group(0) @binding(0) var samp: sampler;
+@group(0) @binding(1) var picture: texture_2d<f32>;
+
+struct Corner {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) color: vec4<f32>) -> Corner {
+    var out: Corner;
+    out.position = vec4<f32>(position, 0.0, 1.0);
+    out.uv = uv;
+    out.color = color;
+    return out;
+}
+
+struct FsIn {
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@fragment
+fn fs(in: FsIn) -> @location(0) vec4<f32> {
+    return textureSample(picture, samp, in.uv) * in.color;
+}
+"#;
+
+/// a corner of an overlay mesh as the frame's vertex buffer takes it: clip
+/// space, its uv and its premultiplied colour, which is what
+/// `crate::OverlayVertex` turns into once it is placed.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Corner {
+    position: [f32; 2],
+    uv: [f32; 2],
+    color: [u8; 4],
+}
+
 /// a screen's picture and where it goes.
 struct Screen {
     staging: Option<Staging>,
@@ -105,11 +157,39 @@ struct Staging {
     capacity: usize,
 }
 
+impl Staging {
+    fn empty() -> Staging {
+        Staging { buffer: vk::Buffer::null(), memory: vk::DeviceMemory::null(), mapped: std::ptr::null_mut(), capacity: 0 }
+    }
+}
+
 /// a uniform block's buffer, kept mapped.
 struct Uniform {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut u8,
+}
+
+/// one of the overlay's textures on the device, kept by its id, with the set
+/// its meshes bind it through.
+struct Picture {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+    set: vk::DescriptorSet,
+    size: [u32; 2],
+}
+
+/// one mesh of an overlay as this frame draws it: where its indices start in
+/// the frame's index buffer, how many, which vertex they start at, the set its
+/// texture is bound through, and the part of the window it shows in.
+struct OverlayDraw {
+    first: u32,
+    count: u32,
+    vertex_offset: i32,
+    set: vk::DescriptorSet,
+    scissor: vk::Rect2D,
 }
 
 /// the screens on a Vulkan 1.1 device's swapchain.
@@ -139,6 +219,11 @@ pub struct Presenter {
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    /// the menu's pipeline: the same pass and layout, blended over the screens.
+    overlay_pipeline: vk::Pipeline,
+    /// the sets the overlay's texture goes through.
+    overlay_pool: vk::DescriptorPool,
+    overlay_textures: HashMap<u64, Picture>,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     // a frame's own set a screen, so a frame being recorded never rewrites the
@@ -151,6 +236,11 @@ pub struct Presenter {
     // GPU may still be reading the other frame's
     screens: [[Screen; 2]; FRAMES],
     uniforms: [[Uniform; 2]; FRAMES],
+    /// a frame's own corners, indices and meshes of the overlay: the GPU may
+    /// still be reading the other frame's
+    overlay_vertices: [Staging; FRAMES],
+    overlay_indices: [Staging; FRAMES],
+    overlay_draws: [Vec<OverlayDraw>; FRAMES],
     command_pool: vk::CommandPool,
     commands: Vec<vk::CommandBuffer>,
     /// waited on when a frame starts, one a frame.
@@ -243,6 +333,12 @@ impl Presenter {
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
+            overlay_pipeline: vk::Pipeline::null(),
+            overlay_pool: vk::DescriptorPool::null(),
+            overlay_textures: HashMap::new(),
+            overlay_vertices: std::array::from_fn(|_| Staging::empty()),
+            overlay_indices: std::array::from_fn(|_| Staging::empty()),
+            overlay_draws: std::array::from_fn(|_| Vec::new()),
             descriptor_pool: vk::DescriptorPool::null(),
             sets: [[vk::DescriptorSet::null(); 2]; FRAMES],
             nearest: vk::Sampler::null(),
@@ -275,6 +371,8 @@ impl Presenter {
         self.descriptor_layout = unsafe { create_descriptor_layout(&device) }?;
         self.pipeline_layout = unsafe { create_pipeline_layout(&device, self.descriptor_layout) }?;
         self.pipeline = unsafe { create_pipeline(&device, self.pipeline_layout, self.render_pass) }?;
+        self.overlay_pipeline = unsafe { create_overlay_pipeline(&device, self.pipeline_layout, self.render_pass) }?;
+        self.overlay_pool = unsafe { create_overlay_pool(&device) }?;
         self.nearest = unsafe { create_sampler(&device, false) }?;
         self.linear = unsafe { create_sampler(&device, true) }?;
         let (pool, sets) = unsafe { create_descriptors(&device, self.descriptor_layout) }?;
@@ -420,15 +518,16 @@ impl Presenter {
         unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }.to_string_lossy().into_owned()
     }
 
-    /// puts a frame's screens on the window. a frame the window will not take
-    /// yet is dropped; the next one draws into a swapchain made for its size.
-    pub fn present(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], smooth: bool) {
-        if let Err(error) = self.draw(shown, smooth) {
+    /// puts a frame's screens, and the menu over them, on the window. a frame
+    /// the window will not take yet is dropped; the next one draws into a
+    /// swapchain made for its size.
+    pub fn present(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], smooth: bool, overlays: Vec<Arc<Overlay>>) {
+        if let Err(error) = self.draw(shown, smooth, overlays) {
             log::error!("Vulkan could not show a frame, {error}");
         }
     }
 
-    fn draw(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], smooth: bool) -> Result<(), String> {
+    fn draw(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], smooth: bool, overlays: Vec<Arc<Overlay>>) -> Result<(), String> {
         let device = self.device.clone();
         let frame = self.frame;
         // nothing this frame touches may still be in the GPU's hands: the
@@ -443,6 +542,7 @@ impl Presenter {
         }
         self.stage(shown, frame)?;
         self.update_uniforms(smooth, frame);
+        self.stage_overlays(&overlays, frame);
 
         // SAFETY: an acquire on the swapchain and the frame's semaphore
         let acquired = unsafe { self.swapchain_fn.acquire_next_image(self.swapchain, u64::MAX, self.available[frame], vk::Fence::null()) };
@@ -513,6 +613,27 @@ impl Presenter {
             unsafe {
                 device.cmd_bind_descriptor_sets(command, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout, 0, &[self.sets[frame][screen]], &[]);
                 device.cmd_draw(command, 3, 1, 0, 0);
+            }
+        }
+        if !self.overlay_draws[frame].is_empty() {
+            // SAFETY: the frame's own corners and indices, and the sets and
+            // textures the overlay came with
+            unsafe {
+                device.cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, self.overlay_pipeline);
+                device.cmd_bind_vertex_buffers(command, 0, &[self.overlay_vertices[frame].buffer], &[0]);
+                device.cmd_bind_index_buffer(command, self.overlay_indices[frame].buffer, 0, vk::IndexType::UINT32);
+            }
+            for draw in &self.overlay_draws[frame] {
+                if draw.count == 0 || draw.scissor.extent.width == 0 || draw.scissor.extent.height == 0 {
+                    continue;
+                }
+                // SAFETY: a mesh of this frame's overlay, its scissor inside the
+                // window, and the set its texture was written into
+                unsafe {
+                    device.cmd_set_scissor(command, 0, &[draw.scissor]);
+                    device.cmd_bind_descriptor_sets(command, vk::PipelineBindPoint::GRAPHICS, self.pipeline_layout, 0, &[draw.set], &[]);
+                    device.cmd_draw_indexed(command, draw.count, 1, draw.first, draw.vertex_offset, 0);
+                }
             }
         }
         // SAFETY: ending the pass and the buffer this frame recorded
@@ -632,7 +753,9 @@ impl Presenter {
                     // SAFETY: a buffer of this presenter, nothing in flight
                     unsafe { destroy_staging(&device, staging) };
                 }
-                self.screens[frame][index].staging = Some(unsafe { create_staging(&device, &self.instance, self.physical, needs) }?);
+                self.screens[frame][index].staging = Some(unsafe {
+                    create_staging(&device, &self.instance, self.physical, needs, vk::BufferUsageFlags::TRANSFER_SRC)
+                }?);
             }
             let staging = self.screens[frame][index].staging.as_ref().expect("a staging buffer was just made");
             // SAFETY: a mapped buffer of exactly this many bytes
@@ -694,6 +817,183 @@ impl Presenter {
         }
     }
 
+    /// the menu's textures onto the device, and its meshes into this frame's
+    /// corners and indices, placed where the layout puts them.
+    fn stage_overlays(&mut self, overlays: &[Arc<Overlay>], frame: usize) {
+        self.overlay_draws[frame].clear();
+        if overlays.is_empty() {
+            return;
+        }
+        let device = self.device.clone();
+        let (width, height) = (self.extent.width as f32, self.extent.height as f32);
+        let (layout_width, layout_height) = (self.layout.0.max(1) as f32, self.layout.1.max(1) as f32);
+        let scale = (width / layout_width).min(height / layout_height);
+        let left = (width - layout_width * scale) / 2.0;
+        let top = (height - layout_height * scale) / 2.0;
+        let bottom = self.screens[frame][1].shown.then_some(self.screens[frame][1].area);
+        // a texture the menu changes or lets go of may be one the other frame
+        // still reads
+        if overlays.iter().any(|overlay| !overlay.textures.is_empty() || !overlay.free.is_empty()) {
+            // SAFETY: nothing in flight may read what is about to be written or
+            // destroyed
+            unsafe {
+                let _ = device.device_wait_idle();
+            }
+        }
+        let mut corners: Vec<Corner> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut draws: Vec<OverlayDraw> = Vec::new();
+        for overlay in overlays {
+            let mut sets: HashMap<u64, vk::DescriptorSet> = HashMap::new();
+            for texture in &overlay.textures {
+                match self.overlay_picture(texture) {
+                    Ok(set) => {
+                        sets.insert(texture.id, set);
+                    }
+                    Err(error) => log::warn!("a texture of the menu did not go to Vulkan, {error}"),
+                }
+            }
+            for id in &overlay.free {
+                if let Some(picture) = self.overlay_textures.remove(id) {
+                    // SAFETY: the device was let finish above
+                    unsafe { destroy_picture(&device, picture) };
+                }
+            }
+            // where the overlay's space sits in the window: over the bottom
+            // screen, over the whole layout, or the menu's 640x480 in the
+            // middle, as GLES places them
+            let (rect, space) = if overlay.bottom && bottom.is_some() {
+                let (x, y, fit) = crate::fitted(bottom.unwrap_or_default());
+                ([left + x * scale, top + y * scale, 640.0 * fit * scale, 480.0 * fit * scale], (640.0, 480.0))
+            } else if overlay.whole {
+                ([left, top, layout_width * scale, layout_height * scale], (layout_width, layout_height))
+            } else {
+                let down = if layout_height > layout_width { 0.0 } else { (layout_height - 480.0) / 2.0 };
+                ([left + (layout_width - 640.0) / 2.0 * scale, top + down * scale, 640.0 * scale, 480.0 * scale], (640.0, 480.0))
+            };
+            let (step_x, step_y) = (rect[2] / space.0, rect[3] / space.1);
+            for mesh in &overlay.meshes {
+                let Some(&set) = sets.get(&mesh.texture) else { continue };
+                if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+                    continue;
+                }
+                let Some(scissor) = scissor_of(mesh.clip, rect, step_x, step_y, self.extent) else { continue };
+                let vertex_offset = corners.len() as i32;
+                for vertex in &mesh.vertices {
+                    let x = rect[0] + vertex.position[0] * step_x;
+                    let y = rect[1] + vertex.position[1] * step_y;
+                    corners.push(Corner {
+                        position: [2.0 * x / width - 1.0, 2.0 * y / height - 1.0],
+                        uv: vertex.uv,
+                        color: vertex.color,
+                    });
+                }
+                let first = indices.len() as u32;
+                indices.extend_from_slice(&mesh.indices);
+                draws.push(OverlayDraw { first, count: mesh.indices.len() as u32, vertex_offset, set, scissor });
+            }
+        }
+        if draws.is_empty() {
+            return;
+        }
+        // SAFETY: the corners and indices just built, as bytes
+        let vertex_bytes = unsafe { std::slice::from_raw_parts(corners.as_ptr().cast::<u8>(), std::mem::size_of_val(corners.as_slice())) };
+        if let Err(error) = unsafe {
+            fill_stream(&device, &self.instance, self.physical, &mut self.overlay_vertices[frame], vertex_bytes, vk::BufferUsageFlags::VERTEX_BUFFER)
+        } {
+            log::warn!("the menu's corners did not go to Vulkan, {error}");
+            return;
+        }
+        // SAFETY: the indices just built, as bytes
+        let index_bytes = unsafe { std::slice::from_raw_parts(indices.as_ptr().cast::<u8>(), std::mem::size_of_val(indices.as_slice())) };
+        if let Err(error) = unsafe {
+            fill_stream(&device, &self.instance, self.physical, &mut self.overlay_indices[frame], index_bytes, vk::BufferUsageFlags::INDEX_BUFFER)
+        } {
+            log::warn!("the menu's indices did not go to Vulkan, {error}");
+            return;
+        }
+        self.overlay_draws[frame] = draws;
+    }
+
+    /// a texture the menu draws with, made or changed, and the set its meshes
+    /// bind it through. the device is let finish before a texture is written,
+    /// as stage_overlays did for the frame.
+    fn overlay_picture(&mut self, texture: &OverlayTexture) -> Result<vk::DescriptorSet, String> {
+        let device = self.device.clone();
+        let known = self.overlay_textures.get(&texture.id).map(|picture| (picture.set, picture.size));
+        let (set, first) = match known {
+            // a part of a texture already there, or the same size again
+            Some((set, size)) if texture.offset.is_some() || size == texture.size => (set, false),
+            _ => {
+                if let Some(old) = self.overlay_textures.remove(&texture.id) {
+                    // SAFETY: the device was let finish before this frame's
+                    // overlays were staged
+                    unsafe { destroy_picture(&device, old) };
+                }
+                let [width, height] = texture.size;
+                // SAFETY: an image and a view of this device, a sampler, and a
+                // set of this presenter's pool
+                let (image, memory) = unsafe { create_screen_image(&device, &self.instance, self.physical, width.max(1), height.max(1)) }?;
+                let view = unsafe { create_view(&device, image, SCREEN_FORMAT) }?;
+                let sampler = unsafe { create_sampler(&device, texture.linear) }?;
+                let set = unsafe { self.overlay_set(view, sampler) }?;
+                self.overlay_textures.insert(texture.id, Picture { image, memory, view, sampler, set, size: texture.size });
+                (set, true)
+            }
+        };
+        let rows = (texture.pixels.len() / 4) as u32 / texture.size[0].max(1);
+        if rows == 0 || texture.size[0] == 0 {
+            return Ok(set);
+        }
+        let image = self.overlay_textures.get(&texture.id).map(|picture| picture.image).ok_or("a menu texture went away")?;
+        // SAFETY: an image of this presenter's, a staging buffer of the call's
+        // own, and a one-shot command buffer of its pool
+        unsafe {
+            upload_overlay(
+                &device,
+                &self.instance,
+                self.physical,
+                self.command_pool,
+                self.queue,
+                image,
+                first,
+                [texture.size[0], rows],
+                texture.offset.unwrap_or([0, 0]),
+                &texture.pixels,
+            )
+        }?;
+        Ok(set)
+    }
+
+    /// a new set with a texture and its sampler in it.
+    unsafe fn overlay_set(&self, view: vk::ImageView, sampler: vk::Sampler) -> Result<vk::DescriptorSet, String> {
+        let layouts = [self.descriptor_layout];
+        // SAFETY: a set of the pool this presenter made, of a layout it takes
+        let set = unsafe {
+            self.device
+                .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.overlay_pool).set_layouts(&layouts))
+        }
+        .map_err(|error| format!("no Vulkan descriptor set for a menu texture: {error}"))?;
+        let set = set[0];
+        let sampler_info = [vk::DescriptorImageInfo::default().sampler(sampler)];
+        let picture_info = [vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&sampler_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&picture_info),
+        ];
+        // SAFETY: a set of this presenter's, before any frame binds it
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+        Ok(set)
+    }
+
     /// lets everything go: the frames in flight first, then the objects in the
     /// order they were made.
     fn destroy_objects(&mut self) {
@@ -733,6 +1033,20 @@ impl Presenter {
                     }
                 }
             }
+        }
+        for stream in self.overlay_vertices.iter_mut().chain(self.overlay_indices.iter_mut()) {
+            if stream.buffer != vk::Buffer::null() {
+                unsafe { destroy_staging(&device, std::mem::replace(stream, Staging::empty())) };
+            }
+        }
+        for (_, picture) in self.overlay_textures.drain() {
+            unsafe { destroy_picture(&device, picture) };
+        }
+        if self.overlay_pool != vk::DescriptorPool::null() {
+            unsafe { device.destroy_descriptor_pool(self.overlay_pool, None) };
+        }
+        if self.overlay_pipeline != vk::Pipeline::null() {
+            unsafe { device.destroy_pipeline(self.overlay_pipeline, None) };
         }
         if self.descriptor_pool != vk::DescriptorPool::null() {
             unsafe { device.destroy_descriptor_pool(self.descriptor_pool, None) };
@@ -775,6 +1089,238 @@ impl Drop for Presenter {
 impl Uniform {
     fn empty() -> Uniform {
         Uniform { buffer: vk::Buffer::null(), memory: vk::DeviceMemory::null(), mapped: std::ptr::null_mut() }
+    }
+}
+
+/// where a mesh's clip sits in the window, cut to it, or nothing if none of
+/// it shows.
+fn scissor_of(clip: [u32; 4], rect: [f32; 4], step_x: f32, step_y: f32, extent: vk::Extent2D) -> Option<vk::Rect2D> {
+    let x = (rect[0] + clip[0] as f32 * step_x).floor().max(0.0);
+    let y = (rect[1] + clip[1] as f32 * step_y).floor().max(0.0);
+    let right = (rect[0] + clip[2] as f32 * step_x).ceil().min(extent.width as f32);
+    let bottom = (rect[1] + clip[3] as f32 * step_y).ceil().min(extent.height as f32);
+    if right <= x || bottom <= y {
+        return None;
+    }
+    Some(vk::Rect2D {
+        offset: vk::Offset2D { x: x as i32, y: y as i32 },
+        extent: vk::Extent2D { width: (right - x) as u32, height: (bottom - y) as u32 },
+    })
+}
+
+/// a stream buffer a frame fills with its corners or indices, made bigger when
+/// what goes in it outgrows it.
+unsafe fn fill_stream(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    stream: &mut Staging,
+    bytes: &[u8],
+    usage: vk::BufferUsageFlags,
+) -> Result<(), String> {
+    if stream.buffer == vk::Buffer::null() || stream.capacity < bytes.len() {
+        if stream.buffer != vk::Buffer::null() {
+            // the other frame may still be drawing with it, and this grows
+            // only when a menu outgrows it
+            // SAFETY: nothing in flight may read what is about to go
+            unsafe {
+                let _ = device.device_wait_idle();
+                destroy_staging(device, std::mem::replace(stream, Staging::empty()));
+            }
+        }
+        // SAFETY: a buffer of this device for bytes the CPU writes
+        *stream = unsafe { create_staging(device, instance, physical, bytes.len().max(64), usage) }?;
+    }
+    // SAFETY: a mapped buffer of at least this many bytes
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), stream.mapped, bytes.len()) };
+    Ok(())
+}
+
+/// a menu texture and what binds it, let go of.
+unsafe fn destroy_picture(device: &ash::Device, picture: Picture) {
+    // SAFETY: handles of this device, off its last frame
+    unsafe {
+        if picture.sampler != vk::Sampler::null() {
+            device.destroy_sampler(picture.sampler, None);
+        }
+        if picture.view != vk::ImageView::null() {
+            device.destroy_image_view(picture.view, None);
+        }
+        if picture.image != vk::Image::null() {
+            device.destroy_image(picture.image, None);
+        }
+        if picture.memory != vk::DeviceMemory::null() {
+            device.free_memory(picture.memory, None);
+        }
+    }
+}
+
+/// the pool the menu's textures get their sets from, of the layout the screens
+/// use: a sampler and a sampled picture.
+unsafe fn create_overlay_pool(device: &ash::Device) -> Result<vk::DescriptorPool, String> {
+    let sizes = [
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLER).descriptor_count(OVERLAY_SETS),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(OVERLAY_SETS),
+        vk::DescriptorPoolSize::default().ty(vk::DescriptorType::UNIFORM_BUFFER).descriptor_count(OVERLAY_SETS),
+    ];
+    // SAFETY: a pool of this device for the sets the menu's textures take
+    unsafe { device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(OVERLAY_SETS).pool_sizes(&sizes), None) }
+        .map_err(|error| format!("no Vulkan descriptor pool for the menu: {error}"))
+}
+
+/// copies a menu texture's pixels into its image and leaves it ready to
+/// sample. first says the image has never held a picture.
+unsafe fn upload_overlay(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    image: vk::Image,
+    first: bool,
+    size: [u32; 2],
+    at: [u32; 2],
+    pixels: &[u8],
+) -> Result<(), String> {
+    // SAFETY: a staging buffer of this device, for these bytes
+    let staging = unsafe { create_staging(device, instance, physical, pixels.len().max(1), vk::BufferUsageFlags::TRANSFER_SRC) }?;
+    // SAFETY: a mapped buffer of exactly this many bytes
+    unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), staging.mapped, pixels.len()) };
+    // SAFETY: a command buffer of this presenter's pool, and a fence of its
+    // device
+    let command = unsafe {
+        device.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1),
+        )
+    }
+    .map_err(|error| format!("no Vulkan command buffer for a menu texture: {error}"))?[0];
+    let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+        .map_err(|error| format!("no Vulkan fence for a menu texture: {error}"))?;
+    let run = || -> Result<(), String> {
+        // SAFETY: a one-shot command buffer of this call's own
+        unsafe {
+            device
+                .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+                .map_err(|error| format!("no Vulkan command buffer for a menu texture: {error}"))?;
+        }
+        let old = match first {
+            true => vk::ImageLayout::UNDEFINED,
+            false => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        // SAFETY: the image, and a buffer this call made to copy into it
+        unsafe {
+            transition(device, command, image, old, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            let region = vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D { x: at[0] as i32, y: at[1] as i32, z: 0 },
+                image_extent: vk::Extent3D { width: size[0].max(1), height: size[1].max(1), depth: 1 },
+            };
+            device.cmd_copy_buffer_to_image(command, staging.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+            transition(device, command, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            device
+                .end_command_buffer(command)
+                .map_err(|error| format!("no Vulkan command buffer for a menu texture: {error}"))?;
+        }
+        let buffers = [command];
+        let submit = vk::SubmitInfo::default().command_buffers(&buffers);
+        // SAFETY: the queue this presenter made its device with, and the fence
+        // this call made to wait the copy out
+        unsafe {
+            device
+                .queue_submit(queue, &[submit], fence)
+                .map_err(|error| format!("a menu texture was not copied: {error}"))?;
+            device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|error| format!("a menu texture was not copied: {error}"))?;
+        }
+        Ok(())
+    };
+    let done = run();
+    // SAFETY: the fence and command buffer of this call, and its staging
+    // buffer, the copy done
+    unsafe {
+        device.destroy_fence(fence, None);
+        device.free_command_buffers(command_pool, &[command]);
+        destroy_staging(device, staging);
+    }
+    done
+}
+
+/// the menu's pipeline: the same pass and pipeline layout, corners from a
+/// vertex buffer, and its premultiplied colour blended over what is there.
+unsafe fn create_overlay_pipeline(device: &ash::Device, layout: vk::PipelineLayout, render_pass: vk::RenderPass) -> Result<vk::Pipeline, String> {
+    let module = unsafe { create_shader_module(device, OVERLAY_SHADERS, "menu's") }?;
+    let vertex = CString::new("vs").expect("a name without a NUL");
+    let fragment = CString::new("fs").expect("a name without a NUL");
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(module)
+            .name(vertex.as_c_str()),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(module)
+            .name(fragment.as_c_str()),
+    ];
+    let bindings = [vk::VertexInputBindingDescription { binding: 0, stride: CORNER_STRIDE as u32, input_rate: vk::VertexInputRate::VERTEX }];
+    let attributes = [
+        vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 0 },
+        vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 8 },
+        vk::VertexInputAttributeDescription { location: 2, binding: 0, format: vk::Format::R8G8B8A8_UNORM, offset: 16 },
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&bindings)
+        .vertex_attribute_descriptions(&attributes);
+    let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
+    let raster = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let blend = [vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::ONE)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD)
+        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let blending = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend);
+    let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
+    let info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&assembly)
+        .viewport_state(&viewport)
+        .rasterization_state(&raster)
+        .multisample_state(&multisample)
+        .color_blend_state(&blending)
+        .dynamic_state(&dynamic_state)
+        .layout(layout)
+        .render_pass(render_pass)
+        .subpass(0);
+    // SAFETY: a pipeline of this device, with the module and layouts above
+    let made = unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) };
+    // SAFETY: the module was only for making the pipeline
+    unsafe { device.destroy_shader_module(module, None) };
+    match made {
+        Ok(pipelines) => Ok(pipelines[0]),
+        Err((_, error)) => Err(format!("no Vulkan pipeline for the menu: {error}")),
     }
 }
 
@@ -917,14 +1463,17 @@ unsafe fn create_view(device: &ash::Device, image: vk::Image, format: vk::Format
 }
 
 /// a host-visible buffer a picture's bytes go to, kept mapped.
-unsafe fn create_staging(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, size: usize) -> Result<Staging, String> {
+unsafe fn create_staging(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    size: usize,
+    usage: vk::BufferUsageFlags,
+) -> Result<Staging, String> {
     let size = size as u64;
     // SAFETY: a buffer of this device, for bytes the CPU writes
     let buffer = unsafe {
-        device.create_buffer(
-            &vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE),
-            None,
-        )
+        device.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE), None)
     }
     .map_err(|error| format!("no Vulkan staging buffer: {error}"))?;
     let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
@@ -1198,10 +1747,10 @@ unsafe fn create_pipeline_layout(device: &ash::Device, set: vk::DescriptorSetLay
 
 /// the screens' shaders: WGSL through naga to SPIR-V, then a module. both entry
 /// points come from the one module.
-unsafe fn create_shader_module(device: &ash::Device) -> Result<vk::ShaderModule, String> {
-    let module = naga::front::wgsl::parse_str(SHADERS).map_err(|error| format!("the screens' shader does not parse: {error}"))?;
+unsafe fn create_shader_module(device: &ash::Device, source: &str, what: &str) -> Result<vk::ShaderModule, String> {
+    let module = naga::front::wgsl::parse_str(source).map_err(|error| format!("the {what} shader does not parse: {error}"))?;
     let mut validator = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty());
-    let info = validator.validate(&module).map_err(|error| format!("the screens' shader does not validate: {error}"))?;
+    let info = validator.validate(&module).map_err(|error| format!("the {what} shader does not validate: {error}"))?;
     let options = naga::back::spv::Options {
         // 1.0 is what every 1.1 device takes
         lang_version: (1, 0),
@@ -1212,7 +1761,7 @@ unsafe fn create_shader_module(device: &ash::Device) -> Result<vk::ShaderModule,
         ..naga::back::spv::Options::default()
     };
     let words = naga::back::spv::write_vec(&module, &info, &options, None)
-        .map_err(|error| format!("the screens' shader does not turn into SPIR-V: {error}"))?;
+        .map_err(|error| format!("the {what} shader does not turn into SPIR-V: {error}"))?;
     // SAFETY: words naga wrote for this device's Vulkan
     unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None) }
         .map_err(|error| format!("no Vulkan shader module: {error}"))
@@ -1221,7 +1770,7 @@ unsafe fn create_shader_module(device: &ash::Device) -> Result<vk::ShaderModule,
 /// the pipeline: one triangle a screen, no vertex buffer, no depth, no blend,
 /// the viewport and scissor set as the frame is recorded.
 unsafe fn create_pipeline(device: &ash::Device, layout: vk::PipelineLayout, render_pass: vk::RenderPass) -> Result<vk::Pipeline, String> {
-    let module = unsafe { create_shader_module(device) }?;
+    let module = unsafe { create_shader_module(device, SHADERS, "screens'") }?;
     let vertex = CString::new("vs").expect("a name without a NUL");
     let fragment = CString::new("fs").expect("a name without a NUL");
     let stages = [
@@ -1333,11 +1882,25 @@ mod tests {
     /// the shader the presenter builds naga through is valid and has both
     /// entry points.
     #[test]
-    fn the_screens_shader_compiles() {
-        let module = naga::front::wgsl::parse_str(SHADERS).expect("the shader parses");
-        let mut validator = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty());
-        validator.validate(&module).expect("the shader validates");
-        let names: Vec<&str> = module.entry_points.iter().map(|entry| entry.name.as_str()).collect();
-        assert!(names.contains(&"vs") && names.contains(&"fs"), "{names:?}");
+    fn the_shaders_compile() {
+        for (source, what) in [(SHADERS, "screens"), (OVERLAY_SHADERS, "menu")] {
+            let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|error| panic!("the {what} shader does not parse, {error}"));
+            let mut validator = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty());
+            validator.validate(&module).unwrap_or_else(|error| panic!("the {what} shader does not validate, {error}"));
+            let names: Vec<&str> = module.entry_points.iter().map(|entry| entry.name.as_str()).collect();
+            assert!(names.contains(&"vs") && names.contains(&"fs"), "{what}: {names:?}");
+        }
+    }
+
+    /// an overlay's clip is cut to the window, and nothing shows outside it.
+    #[test]
+    fn an_overlays_clip_stays_in_the_window() {
+        let extent = vk::Extent2D { width: 640, height: 480 };
+        let rect = [0.0, 0.0, 640.0, 480.0];
+        let cut = scissor_of([0, 0, 640, 480], rect, 1.0, 1.0, extent).expect("the whole of it shows");
+        assert_eq!((cut.offset.x, cut.offset.y, cut.extent.width, cut.extent.height), (0, 0, 640, 480));
+        let cut = scissor_of([600, 460, 700, 500], rect, 1.0, 1.0, extent).expect("its top left corner shows");
+        assert_eq!((cut.offset.x, cut.offset.y, cut.extent.width, cut.extent.height), (600, 460, 40, 20));
+        assert!(scissor_of([700, 500, 800, 600], rect, 1.0, 1.0, extent).is_none());
     }
 }

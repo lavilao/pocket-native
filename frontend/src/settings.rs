@@ -72,6 +72,20 @@ impl Aspect {
     }
 }
 
+/// what puts the screens on the display: the OpenGL ES renderer, the one the
+/// handhelds run, or Vulkan 1.1, which shows the software rasterizer's
+/// pictures itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Presenter {
+    #[default]
+    OpenGlEs,
+    Vulkan,
+}
+
+impl Presenter {
+    pub const ALL: [Presenter; 2] = [Presenter::OpenGlEs, Presenter::Vulkan];
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Power {
     Saver,
@@ -160,6 +174,8 @@ pub struct Settings {
     /// does, which Auto leaves to.
     pub rotation: Rotation,
     pub frame_cap: u32,
+    /// the backend the screens go out through, from the next start.
+    pub presenter: Presenter,
     pub power: Power,
     pub touch_speed: Speed,
     pub cursor: Cursor,
@@ -197,6 +213,7 @@ impl Default for Settings {
             show_saving: true,
             rotation: Rotation::Auto,
             frame_cap: 30,
+            presenter: Presenter::OpenGlEs,
             power: Power::Performance,
             touch_speed: Speed::Normal,
             cursor: Cursor::Auto,

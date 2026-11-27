@@ -128,22 +128,19 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         }
     }
 
-    // ZAKURO_GPU picks the backend. vulkan shows the screens through Vulkan
-    // and leaves the 3D to the software rasterizer, so the GLES renderer
-    // never starts; a Vulkan that could not start, or any other name, leaves
-    // the menu's settings in charge as before.
-    let asking = std::env::var("ZAKURO_GPU").ok().and_then(|name| zakuro_gpu::renderer::RendererKind::parse(&name));
+    // the menu's presenter: Vulkan shows the software rasterizer's screens on
+    // the window itself and the GLES renderer never starts. a device without a
+    // Vulkan that can show them, or a build without the feature, is drawn
+    // through OpenGL ES as before.
     let mut vulkan = false;
-    match asking {
-        Some(zakuro_gpu::renderer::RendererKind::Vulkan) => match system.gpu.enable_vulkan_presenter() {
+    if system.config.vulkan {
+        match system.gpu.enable_vulkan_presenter() {
             Ok(name) => {
                 log::info!("switch: drawing in software, the screens shown through {name}");
                 vulkan = true;
             }
-            Err(error) => log::warn!("{error}, drawing as the menu says"),
-        },
-        Some(other) => log::info!("switch: ZAKURO_GPU names {other:?}, the menu's renderer still decides"),
-        None => {}
+            Err(error) => log::warn!("{error}, showing them through OpenGL ES instead"),
+        }
     }
 
     if !vulkan && system.config.hardware_renderer && system.config.software_draws {

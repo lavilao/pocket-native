@@ -1,9 +1,10 @@
 //! the Vulkan 1.1 device, found and opened, and the screens shown through it.
 //!
-//! GLES stays the renderer the app draws with by default. with
-//! `ZAKURO_GPU=vulkan` the 3D is drawn by the software rasterizer and this
-//! puts the pictures on the window: `present` is the swapchain end of it, and
-//! the source every Vulkan call comes from lives in this module.
+//! GLES stays the renderer the app draws with by default. with the menu's
+//! `Show screens with` setting on Vulkan, the 3D is drawn by the software
+//! rasterizer and this puts the pictures, and the menu over them, on the
+//! window: `present` is the swapchain end of it, and the source every Vulkan
+//! call comes from lives in this module.
 //!
 //! it is Vulkan 1.1 and nothing newer: the descriptor sets are ordinary
 //! ones, a render pass sets up the drawing's attachment, and the barriers are

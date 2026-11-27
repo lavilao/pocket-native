@@ -1092,14 +1092,16 @@ impl Gpu {
     /// shows the screens on the panel the GPU drives itself, each in its
     /// area, left, top, width and height in the panel's pixels, the overlays
     /// over them, the top screen filtered when smooth and a picture halfway
-    /// between its last two shown first when interpolating.
+    /// between its last two shown first when interpolating. the Vulkan
+    /// presenter takes the screens and the overlays, and leaves the cursor
+    /// to GLES.
     pub fn present_panel(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], cursor: Option<(i32, i32)>, overlays: Vec<std::sync::Arc<Overlay>>, smooth: bool, interpolate: bool, frames: u32) {
-        // the Vulkan presenter takes the screens alone: the menu is drawn as
-        // GLES overlays, which it cannot take yet
+        // the Vulkan presenter takes the screens and the menu over them; the
+        // touch cursor is GLES's own and is left out
         #[cfg(feature = "vulkan")]
         if let Some(presenter) = self.presenter.as_mut() {
-            let _ = (cursor, overlays, interpolate, frames);
-            presenter.present(shown, smooth);
+            let _ = (cursor, interpolate, frames);
+            presenter.present(shown, smooth, overlays);
             return;
         }
         #[cfg(feature = "gles")]

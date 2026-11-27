@@ -15,7 +15,7 @@ pub enum RendererKind {
 }
 
 impl RendererKind {
-    /// the backend a name stands for, as ZAKURO_GPU takes one.
+    /// the backend a name stands for.
     pub fn parse(name: &str) -> Option<RendererKind> {
         match name.to_ascii_lowercase().as_str() {
             "software" | "none" | "null" => Some(RendererKind::Software),
