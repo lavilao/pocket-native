@@ -7,9 +7,9 @@ license.workspace = true
 [features]
 default = []
 gles = ["dep:glow", "dep:glutin_egl_sys", "dep:libloading"]
-# the Vulkan 1.1 backend: ash opens the device. GLES keeps the 3D, this is
-# an alternative backend beside it, never on in the 32-bit build by default
-vulkan = ["dep:ash"]
+# the Vulkan 1.1 backend: ash opens the device and shows the screens, naga
+# turns the presenter's WGSL into SPIR-V. GLES stays the default backend
+vulkan = ["dep:ash", "dep:naga"]
 
 [dependencies]
 zakuro-common.workspace = true
@@ -31,6 +31,8 @@ glutin_egl_sys = { version = "0.7", optional = true }
 libloading = { version = "0.8", optional = true }
 # loaded, not linked: android's loader and the desktop's are the same code
 ash = { version = "0.38", optional = true, default-features = false, features = ["loaded", "std"] }
+# at runtime for the screens' shaders, the same naga the tests check GLSL with
+naga = { version = "30.0.1", optional = true, features = ["wgsl-in", "spv-out"] }
 
 
 [dev-dependencies]

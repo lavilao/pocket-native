@@ -22,7 +22,18 @@ use registers::*;
 pub use overlay::{fitted, Overlay, OverlayMesh, OverlayTexture, OverlayVertex};
 pub use renderer::{DrawCall, Renderer, SoftwareRenderer};
 #[cfg(feature = "gles")]
-pub use raster::gles::{compiling, compiling_stand_ins, preparing, skip_preparing, waited_draws, layout_scale, layout_size, note_compiler_crash, panel_timing, second_window, set_drops, set_second_shows_top, set_second_stretched, set_second_window, set_stacked, set_top_crop, set_window, shader_compiles, stacked};
+pub use raster::gles::{compiling, compiling_stand_ins, preparing, skip_preparing, waited_draws, layout_scale, layout_size, note_compiler_crash, panel_timing, second_window, set_drops, set_second_shows_top, set_second_stretched, set_second_window, set_stacked, set_top_crop, shader_compiles, stacked};
+
+/// hands the renderers the native window the screens go to, an ANativeWindow
+/// on Android, or takes it back with null. the GLES renderer and the Vulkan
+/// presenter both see it, whichever ends up showing the screens.
+pub fn set_window(window: *mut std::ffi::c_void) {
+    #[cfg(feature = "gles")]
+    raster::gles::set_window(window);
+    #[cfg(feature = "vulkan")]
+    vulkan::set_window(window);
+    let _ = window;
+}
 
 /// how the GPU reaches guest memory.
 pub trait GpuMemory {
@@ -403,6 +414,10 @@ pub struct Gpu {
     /// rasterizer draws them.
     #[cfg(feature = "gles")]
     panel: Option<raster::HostRenderer>,
+    /// the screens on a Vulkan 1.1 swapchain, when the app asks for that
+    /// backend: the software rasterizer draws and this shows the pictures.
+    #[cfg(feature = "vulkan")]
+    presenter: Option<vulkan::present::Presenter>,
     /// the transfer count when the frontend last skipped a picture, behind
     /// real time.
     skipped_at: u64,
@@ -477,6 +492,8 @@ impl Gpu {
             bottom_full_rate: false,
             #[cfg(feature = "gles")]
             panel: None,
+            #[cfg(feature = "vulkan")]
+            presenter: None,
             skip_bottom: true,
             skip_right_eye: true,
             right_buffers: Vec::new(),
@@ -1057,11 +1074,34 @@ impl Gpu {
         Ok(())
     }
 
+    /// shows the screens through Vulkan instead: the software rasterizer draws
+    /// them, and the pictures go to the window on a 1.1 swapchain. says the
+    /// device it shows them on, or why there is none.
+    pub fn enable_vulkan_presenter(&mut self) -> Result<String, String> {
+        #[cfg(feature = "vulkan")]
+        {
+            let presenter = vulkan::present::Presenter::new()?;
+            let name = format!("Vulkan 1.1 on {}", presenter.name());
+            self.presenter = Some(presenter);
+            return Ok(name);
+        }
+        #[cfg(not(feature = "vulkan"))]
+        Err("this build has no Vulkan backend, it is built with --features zakuro-gpu/vulkan".to_owned())
+    }
+
     /// shows the screens on the panel the GPU drives itself, each in its
     /// area, left, top, width and height in the panel's pixels, the overlays
     /// over them, the top screen filtered when smooth and a picture halfway
     /// between its last two shown first when interpolating.
     pub fn present_panel(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], cursor: Option<(i32, i32)>, overlays: Vec<std::sync::Arc<Overlay>>, smooth: bool, interpolate: bool, frames: u32) {
+        // the Vulkan presenter takes the screens alone: the menu is drawn as
+        // GLES overlays, which it cannot take yet
+        #[cfg(feature = "vulkan")]
+        if let Some(presenter) = self.presenter.as_mut() {
+            let _ = (cursor, overlays, interpolate, frames);
+            presenter.present(shown, smooth);
+            return;
+        }
         #[cfg(feature = "gles")]
         if let Some(hardware) = self.resources.hardware.as_mut().or(self.panel.as_mut()) {
             hardware.present(shown, cursor, overlays, smooth, interpolate, frames);
@@ -1075,6 +1115,11 @@ impl Gpu {
         #[cfg(feature = "gles")]
         if let Some(hardware) = self.resources.hardware.as_mut().or(self.panel.as_mut()) {
             hardware.stop();
+        }
+        // the presenter lets go of its device and the window with it
+        #[cfg(feature = "vulkan")]
+        {
+            self.presenter = None;
         }
     }
 

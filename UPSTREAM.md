@@ -18,10 +18,12 @@ this one — that these live:
   the GOU, and the `Pass`/twins machinery in `raster.rs`
 
 so none of that is in this tree, whatever a commit message claims. the
-Vulkan work here is the fork's own and starts at `engine/gpu/src/vulkan/`: a
-1.1 device and the report of what a driver offers, behind
-`--features zakuro-gpu/vulkan`, with the 3D still drawn by OpenGL ES.
-`ZAKURO_GPU=vulkan` writes that report to the log and changes nothing else.
+Vulkan work here is the fork's own, in `engine/gpu/src/vulkan/`: a 1.1
+device, and a presenter that puts the software rasterizer's screens on the
+window through a 1.1 surface and swapchain. `ZAKURO_GPU=vulkan` picks it, and
+then GLES does not start at all: the 3D is drawn on the CPU, and the menu's
+GLES overlays are not drawn yet. upstream's own renderer, the one that draws
+the 3D on the GPU, is still the gap above.
 
 ## how the two lines meet
 

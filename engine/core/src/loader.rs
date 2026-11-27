@@ -128,24 +128,30 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         }
     }
 
-    // ZAKURO_GPU names the backend wanted. vulkan reports the device it
-    // finds; the drawing stays on OpenGL ES until the Vulkan rasterizer is
-    // ported over, see UPSTREAM.md.
-    match std::env::var("ZAKURO_GPU") {
-        Ok(name) => match zakuro_gpu::renderer::RendererKind::parse(&name) {
-            Some(zakuro_gpu::renderer::RendererKind::Vulkan) => log::info!("switch: Vulkan asked for, {}", zakuro_gpu::vulkan_report()),
-            Some(_) => log::info!("switch: ZAKURO_GPU={name}, the menu's renderer still decides"),
-            None => log::warn!("ZAKURO_GPU={name} names no backend: software, opengl and vulkan do"),
+    // ZAKURO_GPU picks the backend. vulkan shows the screens through Vulkan
+    // and leaves the 3D to the software rasterizer, so the GLES renderer
+    // never starts; a Vulkan that could not start, or any other name, leaves
+    // the menu's settings in charge as before.
+    let asking = std::env::var("ZAKURO_GPU").ok().and_then(|name| zakuro_gpu::renderer::RendererKind::parse(&name));
+    let mut vulkan = false;
+    match asking {
+        Some(zakuro_gpu::renderer::RendererKind::Vulkan) => match system.gpu.enable_vulkan_presenter() {
+            Ok(name) => {
+                log::info!("switch: drawing in software, the screens shown through {name}");
+                vulkan = true;
+            }
+            Err(error) => log::warn!("{error}, drawing as the menu says"),
         },
-        Err(_) => {}
+        Some(other) => log::info!("switch: ZAKURO_GPU names {other:?}, the menu's renderer still decides"),
+        None => {}
     }
 
-    if system.config.hardware_renderer && system.config.software_draws {
+    if !vulkan && system.config.hardware_renderer && system.config.software_draws {
         match system.gpu.enable_panel() {
             Ok(()) => log::info!("switch: drawing in software, the screens shown through OpenGL ES"),
             Err(error) => log::warn!("{error}, drawing in software with no panel"),
         }
-    } else if system.config.hardware_renderer {
+    } else if !vulkan && system.config.hardware_renderer {
         match system.gpu.enable_hardware_renderer(system.config.resolution) {
             Ok(name) => log::info!("drawing on {name} through OpenGL ES"),
             Err(error) => log::warn!("{error}, drawing in software"),

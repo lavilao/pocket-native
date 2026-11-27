@@ -1,16 +1,35 @@
-//! a Vulkan 1.1 device, found and opened, and what it offers.
+//! the Vulkan 1.1 device, found and opened, and the screens shown through it.
 //!
-//! the 3D stays on OpenGL ES here. this is the device a Vulkan renderer
-//! draws on, and the answer to whether one can run on a given phone at all.
-//! upstream zakuro's renderer asks Vulkan 1.3 of a driver — it pushes
-//! descriptor sets and draws without render passes under synchronization2 —
-//! and this port targets 1.1, so what a driver has of those is reported
-//! rather than demanded: a phone that reports 1.1 and push descriptors is a
-//! phone the port has to bring the render passes and the older barriers to.
+//! GLES stays the renderer the app draws with by default. with
+//! `ZAKURO_GPU=vulkan` the 3D is drawn by the software rasterizer and this
+//! puts the pictures on the window: `present` is the swapchain end of it, and
+//! the source every Vulkan call comes from lives in this module.
+//!
+//! it is Vulkan 1.1 and nothing newer: the descriptor sets are ordinary
+//! ones, a render pass sets up the drawing's attachment, and the barriers are
+//! the classic form. a device that has none of 1.3 is still enough here.
 
-use std::ffi::CStr;
+use std::ffi::{c_char, c_void, CStr};
 
 use ash::vk;
+
+pub mod present;
+
+/// the native window the screens go to, an ANativeWindow on Android, as
+/// `set_window` last took it.
+static WINDOW: std::sync::atomic::AtomicPtr<c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// hands the Vulkan presenter the window the activity gave the renderer, or
+/// takes it back with null. the GLES renderer gets the same one through its
+/// own `set_window`; the app's `zakuro_gpu::set_window` feeds both.
+pub fn set_window(window: *mut c_void) {
+    WINDOW.store(window, std::sync::atomic::Ordering::Release);
+}
+
+/// the window the presenter draws a surface on, null for none.
+pub(crate) fn window() -> *mut c_void {
+    WINDOW.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// what a device offers a Vulkan renderer.
 #[derive(Debug, Clone)]
@@ -25,66 +44,38 @@ pub struct Report {
     pub discrete: bool,
     /// the queue family draws go on.
     pub queue: u32,
-    /// VK_KHR_push_descriptor, which is how upstream's renderer hands a draw
-    /// its textures and uniforms: an extension on 1.1, core from 1.4.
-    pub push_descriptors: bool,
-    /// dynamic rendering, drawing without render passes: core from 1.3.
-    pub dynamic_rendering: bool,
-    /// synchronization2, the newer barriers: core from 1.3.
-    pub synchronization2: bool,
 }
 
 impl Report {
-    /// whether a device does all of what upstream's renderer asks for, so
-    /// that code would take it as it stands.
-    pub fn meets_upstream(&self) -> bool {
-        self.push_descriptors && self.dynamic_rendering && self.synchronization2
-    }
-
     /// the report, one line for the log.
     pub fn line(&self) -> String {
-        let mut lacks = Vec::new();
-        if !self.push_descriptors {
-            lacks.push("push descriptors");
-        }
-        if !self.dynamic_rendering {
-            lacks.push("dynamic rendering");
-        }
-        if !self.synchronization2 {
-            lacks.push("synchronization2");
-        }
-        let lacks = match lacks.is_empty() {
-            true => "all upstream's renderer asks for".to_owned(),
-            false => format!("no {}", lacks.join(", ")),
-        };
-        format!("Vulkan {} on {} (driver {}), queue {}, {lacks}", self.api, self.name, self.driver, self.queue)
+        format!("Vulkan {} on {} (driver {}), queue {}", self.api, self.name, self.driver, self.queue)
     }
 }
 
 /// the system's Vulkan library. android's loader is libvulkan.so, while
 /// everywhere else the loader answers to libvulkan.so.1.
-fn entry() -> Result<ash::Entry, String> {
+pub(crate) fn entry() -> Result<ash::Entry, String> {
     #[cfg(target_os = "android")]
     {
-        // safe: loading the system's Vulkan library is the documented way to
+        // SAFETY: loading the system's Vulkan library is the documented way to
         // start, and libvulkan.so is the name android gives it
         if let Ok(entry) = unsafe { ash::Entry::load_from("libvulkan.so") } {
             return Ok(entry);
         }
     }
-    // safe: ditto, by the loader's own name
+    // SAFETY: ditto, by the loader's own name
     unsafe { ash::Entry::load() }.map_err(|error| format!("no Vulkan library: {error}"))
 }
 
-/// a Vulkan 1.1 instance, with no surface: draws only, showing the screens
-/// stays the panel's job.
-fn instance(entry: &ash::Entry) -> Result<ash::Instance, String> {
+/// a Vulkan 1.1 instance with the extensions given.
+pub(crate) fn instance(entry: &ash::Entry, extensions: &[*const c_char]) -> Result<ash::Instance, String> {
     let app = vk::ApplicationInfo::default()
         .application_name(c"pocket-native")
         .application_version(vk::make_api_version(0, 0, 1, 0))
         .api_version(vk::API_VERSION_1_1);
-    let info = vk::InstanceCreateInfo::default().application_info(&app);
-    // safe: an instance of an application info this call owns
+    let info = vk::InstanceCreateInfo::default().application_info(&app).enabled_extension_names(extensions);
+    // SAFETY: an instance of an application info this call owns
     unsafe { entry.create_instance(&info, None) }.map_err(|error| format!("no Vulkan 1.1 instance: {error}"))
 }
 
@@ -100,12 +91,12 @@ fn rank(kind: vk::PhysicalDeviceType) -> u8 {
 
 /// a device with a queue draws can go on, a card of its own over a GPU beside
 /// the CPU when there is a choice.
-fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, vk::PhysicalDeviceProperties, u32), String> {
-    // safe: a query of the instance
+pub(crate) fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, vk::PhysicalDeviceProperties, u32), String> {
+    // SAFETY: a query of the instance
     let devices = unsafe { instance.enumerate_physical_devices() }.map_err(|error| format!("no Vulkan devices: {error}"))?;
     let mut best: Option<(vk::PhysicalDevice, vk::PhysicalDeviceProperties, u32)> = None;
     for physical in devices {
-        // safe: queries on a device of the instance
+        // SAFETY: queries on a device of the instance
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
         let Some(family) = families.iter().position(|family| family.queue_flags.contains(vk::QueueFlags::GRAPHICS)) else {
@@ -119,12 +110,32 @@ fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, vk::PhysicalDev
     best.ok_or_else(|| "no Vulkan device with a queue for draws".to_owned())
 }
 
-/// whether a device lists an extension by name.
-fn offers(instance: &ash::Instance, physical: vk::PhysicalDevice, name: &CStr) -> bool {
-    // safe: a query on a device of the instance
-    unsafe { instance.enumerate_device_extension_properties(physical) }
-        .map(|offered| offered.iter().any(|extension| extension.extension_name_as_c_str() == Ok(name)))
-        .unwrap_or(false)
+/// a device with a queue that draws and can show to the surface, which is what
+/// a presenter needs.
+pub(crate) fn pick_presenting(
+    instance: &ash::Instance,
+    surface: &ash::khr::surface::Instance,
+    handle: vk::SurfaceKHR,
+) -> Result<(vk::PhysicalDevice, u32), String> {
+    // SAFETY: a query of the instance
+    let devices = unsafe { instance.enumerate_physical_devices() }.map_err(|error| format!("no Vulkan devices: {error}"))?;
+    let mut best: Option<(vk::PhysicalDevice, u32, u8)> = None;
+    for physical in devices {
+        // SAFETY: queries on a device of the instance and its surface
+        let properties = unsafe { instance.get_physical_device_properties(physical) };
+        let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let family = families.iter().enumerate().position(|(index, family)| {
+            family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                && unsafe { surface.get_physical_device_surface_support(physical, index as u32, handle) }.unwrap_or(false)
+        });
+        let Some(family) = family else { continue };
+        let better = best.as_ref().is_none_or(|(_, _, held)| rank(properties.device_type) > *held);
+        if better {
+            best = Some((physical, family as u32, rank(properties.device_type)));
+        }
+    }
+    best.map(|(physical, family, _)| (physical, family))
+        .ok_or_else(|| "no Vulkan device that both draws and shows the screens".to_owned())
 }
 
 /// a version register as "major.minor.patch".
@@ -134,30 +145,24 @@ fn version(api: u32) -> String {
 
 /// the device's report, or why it gave none.
 fn report(instance: &ash::Instance) -> Result<Report, String> {
-    let (physical, properties, queue) = pick(instance)?;
-    // safe: a device's name is a NUL-terminated string of its properties
+    let (_, properties, queue) = pick(instance)?;
+    // SAFETY: a device's name is a NUL-terminated string of its properties
     let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }.to_string_lossy().into_owned();
-    // from 1.3 these are part of Vulkan itself, before that an extension
-    let core_1_3 = properties.api_version >= vk::API_VERSION_1_3;
     Ok(Report {
         name,
         api: version(properties.api_version),
         driver: properties.driver_version,
         discrete: properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
         queue,
-        push_descriptors: offers(instance, physical, c"VK_KHR_push_descriptor"),
-        dynamic_rendering: core_1_3 || offers(instance, physical, c"VK_KHR_dynamic_rendering"),
-        synchronization2: core_1_3 || offers(instance, physical, c"VK_KHR_synchronization2"),
     })
 }
 
-/// what a Vulkan renderer would have to draw on: the device, its API, and
-/// what it does of what upstream asks.
+/// what a Vulkan renderer would draw on: the device, its API and its queue.
 pub fn describe() -> Result<Report, String> {
     let entry = entry()?;
-    let instance = instance(&entry)?;
+    let instance = instance(&entry, &[])?;
     let report = report(&instance);
-    // safe: nothing made from the instance outlives this call
+    // SAFETY: nothing made from the instance outlives this call
     unsafe { instance.destroy_instance(None) };
     report
 }
@@ -174,42 +179,19 @@ pub fn line() -> String {
 mod tests {
     use super::*;
 
-    fn sample(push_descriptors: bool, dynamic_rendering: bool, synchronization2: bool) -> Report {
-        Report {
-            name: "test".into(),
-            api: "1.3.0".into(),
-            driver: 0,
-            discrete: false,
-            queue: 0,
-            push_descriptors,
-            dynamic_rendering,
-            synchronization2,
-        }
+    /// a version register reads as its three numbers.
+    #[test]
+    fn a_version_reads_as_its_numbers() {
+        assert_eq!(version(vk::make_api_version(0, 1, 1, 0)), "1.1.0");
+        assert_eq!(version(vk::make_api_version(0, 1, 3, 281)), "1.3.281");
     }
 
-    /// a device that has everything upstream asks for needs nothing
-    /// backported.
+    /// a card of its own is the one a renderer wants over a GPU beside the
+    /// CPU, which beats a virtual one.
     #[test]
-    fn a_full_device_meets_upstream() {
-        let report = sample(true, true, true);
-        assert!(report.meets_upstream());
-        assert!(report.line().contains("all upstream's renderer asks for"), "{}", report.line());
-    }
-
-    /// a 1.1 phone lacks all three, and the line names them.
-    #[test]
-    fn a_1_1_device_says_what_it_lacks() {
-        let report = sample(false, false, false);
-        assert!(!report.meets_upstream());
-        let line = report.line();
-        assert!(line.contains("no push descriptors, dynamic rendering, synchronization2"), "{line}");
-    }
-
-    /// one thing missing is named alone.
-    #[test]
-    fn one_missing_thing_is_named_alone() {
-        let report = sample(true, false, true);
-        assert!(!report.meets_upstream());
-        assert!(report.line().contains("no dynamic rendering"), "{}", report.line());
+    fn a_card_beats_a_gpu_beside_the_cpu() {
+        assert!(rank(vk::PhysicalDeviceType::DISCRETE_GPU) > rank(vk::PhysicalDeviceType::INTEGRATED_GPU));
+        assert!(rank(vk::PhysicalDeviceType::INTEGRATED_GPU) > rank(vk::PhysicalDeviceType::VIRTUAL_GPU));
+        assert!(rank(vk::PhysicalDeviceType::VIRTUAL_GPU) > rank(vk::PhysicalDeviceType::OTHER));
     }
 }
