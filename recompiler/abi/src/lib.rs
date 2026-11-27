@@ -7,6 +7,12 @@ use std::ffi::{c_char, c_void, CStr};
 use std::path::Path;
 use std::path::PathBuf;
 
+pub mod abi8;
+pub use abi8::{
+    stack_limit, Code8, Context8, Entry8, GENERATION, HEADER8, Host8, Library8, Module8, NOTHING_HELD, NO_TICKS,
+    Origin, Origins, Piece, Run, STOPPED, STACK, TRAIL,
+};
+
 /// recomp.h, which the generated code includes.
 pub const HEADER: &str = include_str!("../recomp.h");
 
@@ -128,6 +134,10 @@ pub struct Linked {
     count: u32,
     modules: *const c_void,
     module_count: u32,
+    /// codegen version and its recomp_origins (what the functions came
+    /// from), zero and null when the program does not say.
+    generation: u32,
+    origins: *const c_void,
 }
 
 impl Linked {
@@ -143,12 +153,39 @@ impl Linked {
         modules: *const c_void,
         module_count: u32,
     ) -> Linked {
-        Linked { program_id, abi, entries, count, modules, module_count }
+        Linked { program_id, abi, entries, count, modules, module_count, generation: 0, origins: std::ptr::null() }
+    }
+
+    /// same code plus what its functions came from, so it gets checked
+    /// against memory like a library and a function a mod or another game
+    /// version changed stops running.
+    ///
+    /// # Safety
+    ///
+    /// generation and origins must be recomp_generation and recomp_origins
+    /// of the same code.
+    pub unsafe fn with_origins(self, generation: u32, origins: *const c_void) -> Linked {
+        Linked { generation, origins, ..self }
     }
 
     /// the title the code was recompiled from.
     pub fn program_id(&self) -> u64 {
         self.program_id
+    }
+
+    /// the interface version the code was built for.
+    pub fn abi(&self) -> u32 {
+        self.abi
+    }
+
+    /// the codegen version that made the code, zero when the program does
+    /// not say.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    pub(crate) fn origins_ptr(&self) -> *const c_void {
+        self.origins
     }
 }
 
@@ -165,6 +202,8 @@ pub struct Library {
     module_count: usize,
     /// the modules placed somewhere, as base, size and index.
     placed: Vec<(u32, u32, usize)>,
+    /// the interface version the code was made for, 5 to 7 here.
+    abi: u32,
     /// built with RECOMP_FASTMEM, so the host has to give it Context::fastmem.
     fastmem: bool,
     /// the library the tables are in, none when they are linked in.
@@ -186,14 +225,14 @@ impl Library {
             let symbol = |name: &[u8]| -> Result<*const c_void, String> {
                 library.get::<*const c_void>(name).map(|s| *s).map_err(|e| e.to_string())
             };
-            let linked = Linked {
-                program_id: 0,
-                abi: *(symbol(b"recomp_abi")? as *const u32),
-                entries: symbol(b"recomp_entries")?,
-                count: *(symbol(b"recomp_entry_count")? as *const u32),
-                modules: symbol(b"recomp_modules")?,
-                module_count: *(symbol(b"recomp_module_count")? as *const u32),
-            };
+            let linked = Linked::new(
+                0,
+                *(symbol(b"recomp_abi")? as *const u32),
+                symbol(b"recomp_entries")?,
+                *(symbol(b"recomp_entry_count")? as *const u32),
+                symbol(b"recomp_modules")?,
+                *(symbol(b"recomp_module_count")? as *const u32),
+            );
             let mut code = Library::linked(&linked)?;
             code.fastmem = symbol(b"recomp_fastmem").is_ok();
             code._library = Some(library);
@@ -218,10 +257,16 @@ impl Library {
             modules: linked.modules as *const Module,
             module_count: linked.module_count as usize,
             placed: Vec::new(),
+            abi: linked.abi,
             fastmem: false,
             #[cfg(feature = "load")]
             _library: None,
         })
+    }
+
+    /// the interface version the code was made for, 5 to 7 here.
+    pub fn abi(&self) -> u32 {
+        self.abi
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -268,6 +313,66 @@ impl Library {
         if base != 0 {
             self.placed.push((base, size, index));
         }
+    }
+}
+
+/// a library the engine can run, picked by the version its code was made
+/// for: 8 runs on the modern context, 5 to 7 on the legacy one.
+pub enum Loaded {
+    Modern(abi8::Library8),
+    Legacy(Library),
+}
+
+impl Loaded {
+    /// the interface version the code was made for.
+    pub fn abi(&self) -> u32 {
+        match self {
+            Loaded::Modern(code) => code.abi(),
+            Loaded::Legacy(code) => code.abi(),
+        }
+    }
+
+    /// how many functions and modules there is code for.
+    pub fn describe(&self) -> String {
+        match self {
+            Loaded::Modern(code) => code.describe(),
+            Loaded::Legacy(code) => code.describe(),
+        }
+    }
+
+    /// whether the code reaches memory through the host's view of all of it.
+    pub fn needs_fastmem(&self) -> bool {
+        match self {
+            Loaded::Modern(code) => code.needs_fastmem(),
+            Loaded::Legacy(code) => code.needs_fastmem(),
+        }
+    }
+}
+
+/// opens the library a 3dsrecomp build made, whatever version its code was
+/// made for.
+#[cfg(feature = "load")]
+pub fn open(path: &Path) -> Result<Loaded, String> {
+    // SAFETY: the library's symbols are laid out as recomp.h says them, and
+    // recomp_abi says which version of the interface the code was made for
+    let abi = unsafe {
+        let library = libloading::Library::new(path).map_err(|e| e.to_string())?;
+        let symbol = library.get::<*const u32>(b"recomp_abi").map_err(|e| e.to_string())?;
+        **symbol
+    };
+    match abi {
+        8 => abi8::open8(path).map(Loaded::Modern),
+        5..=7 => Library::open(path).map(Loaded::Legacy),
+        other => Err(format!("it was built for version {other} of the interface, this is 8")),
+    }
+}
+
+/// the code linked into the program, whatever version it was made for.
+pub fn linked(linked: &Linked) -> Result<Loaded, String> {
+    match linked.abi() {
+        8 => abi8::linked8(linked).map(Loaded::Modern),
+        5..=7 => Library::linked(linked).map(Loaded::Legacy),
+        other => Err(format!("it was built for version {other} of the interface, this is 8")),
     }
 }
 
