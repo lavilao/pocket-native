@@ -14,6 +14,8 @@ pub mod renderer;
 pub mod shader;
 pub mod tev;
 pub mod texture;
+#[cfg(feature = "vulkan")]
+pub mod vulkan;
 
 use format::ColorFormat;
 use registers::*;
@@ -190,6 +192,20 @@ pub(crate) fn switch(variable: &str, what: &str) -> bool {
 
 fn note(what: &str) {
     log::info!("switch: {what}");
+}
+
+/// what a Vulkan renderer would draw on, one line for the log: the device,
+/// its API and what it does of what upstream's renderer asks for. a build
+/// without the backend says so instead of pretending to a device.
+pub fn vulkan_report() -> String {
+    #[cfg(feature = "vulkan")]
+    {
+        vulkan::line()
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        "this build has no Vulkan backend, it is built with --features zakuro-gpu/vulkan".to_owned()
+    }
 }
 
 /// fast mode's speed-ups one by one, which ZAKURO_FAST_OFF=name,name turns

@@ -1,14 +1,32 @@
 # the upstream
 
-zakuro (whovian64/pocket-native) is this fork's upstream. everything it
-ships — the engine, the gpu line, the loader, the recompiler — comes in
-from its master whole, and this fork's one job is to keep all of it
-running on a 32-bit android phone.
+zakuro (fearkov/zakuro) is where the engine comes from, and this fork's one
+job is to keep it running on a 32-bit android phone.
+
+## what this fork is on, and what it is not
+
+the engine here is zakuro's `engine/` line, merged up to v0.6.1. zakuro's
+master has since moved to a `crates/` line, and it is on that line — not
+this one — that these live:
+
+- the Vulkan renderer, `crates/zakuro-gpu/src/raster/hardware.rs`: it draws
+  the 3D on Vulkan itself and asks 1.3 of a driver (`VK_KHR_push_descriptor`,
+  dynamic rendering, synchronization2)
+- the Vulkan presenter, `crates/zakuro-gpu/src/backend/vulkan.rs`, and the
+  `backend`, `device` and `instance` split under it
+- what came with them: frame interpolation, texture copies and depth maps on
+  the GOU, and the `Pass`/twins machinery in `raster.rs`
+
+so none of that is in this tree, whatever a commit message claims. the
+Vulkan work here is the fork's own and starts at `engine/gpu/src/vulkan/`: a
+1.1 device and the report of what a driver offers, behind
+`--features zakuro-gpu/vulkan`, with the 3D still drawn by OpenGL ES.
+`ZAKURO_GPU=vulkan` writes that report to the log and changes nothing else.
 
 ## how the two lines meet
 
-- this fork's master tracks zakuro's master and takes everything it
-  ships; merged so far: v0.6.0, v0.6.1
+- this fork's master takes upstream's `engine/` line whole when zakuro tags
+  one; merged so far: v0.6.0, v0.6.1
 - two files in recompiler/ stay fork-side on purpose, everything else
   in there is zakuro's as it stands:
   - abi/recomp.h — the fastmem view on a 32-bit host can only hold

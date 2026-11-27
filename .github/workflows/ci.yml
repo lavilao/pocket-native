@@ -17,7 +17,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/lint-syscalls.sh
       - run: cargo build --release --locked
-      - run: cargo test --release --locked --workspace --features zakuro-gpu/gles
+      # both GPU backends compiled and their tests run, the Vulkan one here
+      # and never in the app's own build
+      - run: cargo test --release --locked --workspace --features zakuro-gpu/gles,zakuro-gpu/vulkan
 
   # cross-builds the Android app's library with the runner's NDK, so the
   # Android port keeps building

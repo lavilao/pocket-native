@@ -20,6 +20,10 @@ jobs:
           path: test.keystore
           key: pocket-native-test-keystore-v1
       - run: rustup target add armv7-linux-androideabi
+      # the Vulkan backend has to keep compiling for 32-bit android, which is
+      # where this fork runs: a check, nothing linked, the APK as it was
+      - name: check the Vulkan backend for 32-bit android
+        run: cargo check --release --locked --target armv7-linux-androideabi -p zakuro-gpu --features vulkan
       - name: build pocket-native-android for armv7-linux-androideabi
         run: |
           bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"

@@ -128,6 +128,18 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         }
     }
 
+    // ZAKURO_GPU names the backend wanted. vulkan reports the device it
+    // finds; the drawing stays on OpenGL ES until the Vulkan rasterizer is
+    // ported over, see UPSTREAM.md.
+    match std::env::var("ZAKURO_GPU") {
+        Ok(name) => match zakuro_gpu::renderer::RendererKind::parse(&name) {
+            Some(zakuro_gpu::renderer::RendererKind::Vulkan) => log::info!("switch: Vulkan asked for, {}", zakuro_gpu::vulkan_report()),
+            Some(_) => log::info!("switch: ZAKURO_GPU={name}, the menu's renderer still decides"),
+            None => log::warn!("ZAKURO_GPU={name} names no backend: software, opengl and vulkan do"),
+        },
+        Err(_) => {}
+    }
+
     if system.config.hardware_renderer && system.config.software_draws {
         match system.gpu.enable_panel() {
             Ok(()) => log::info!("switch: drawing in software, the screens shown through OpenGL ES"),
