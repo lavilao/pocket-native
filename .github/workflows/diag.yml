@@ -1,0 +1,20 @@
+# temporary: shows only the compiler's errors for the 32-bit app, because the
+# full build log is too long to read from here. deleted once CI is green.
+name: diag
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup target add armv7-linux-androideabi
+      - name: errors only
+        run: |
+          set -o pipefail
+          cargo check --release --locked --target armv7-linux-androideabi -p pocket-native-android 2>&1 \
+            | grep -E "^error|^ *--> |^[0-9]+ \||^ *\|" -A 2 | head -300
