@@ -155,6 +155,9 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         }
     }
 
+    // the title's cheats, switched off until the menu says which are on
+    system.cheats = crate::cheats::Cheats::load(system.config.data_dir.as_deref(), title.program_id());
+
     system.dlc = dlc;
     system.title = Some(title);
     Ok(system)

@@ -38,6 +38,8 @@ enum Field {
     Power,
     Presenter,
     Option(usize),
+    /// a cheat from the game's cheat file, on or off.
+    Cheat(usize),
     TouchSpeed,
     Cursor,
     Buttons,
@@ -157,6 +159,8 @@ const REGIONS: [&str; 7] = ["Japan", "USA", "Europe", "Australia", "China", "Kor
 #[derive(Default)]
 pub struct Menu {
     pub open: bool,
+    /// the names of the cheats the running game's file holds, in its order.
+    cheats: Vec<String>,
     page: Page,
     cursor: usize,
     /// Reset or Quit waiting for A again.
@@ -180,17 +184,23 @@ fn useful(field: Field) -> bool {
     }
 }
 
-fn sections(page: Page, profile: &Profile) -> Vec<(&'static str, Vec<Field>)> {
+fn sections(page: Page, profile: &Profile, cheats: &[String]) -> Vec<(&'static str, Vec<Field>)> {
     let toggles = |range: std::ops::RangeInclusive<usize>| range.map(Field::Toggle).collect();
     let only = |fields: Vec<Field>| fields.into_iter().filter(|&field| useful(field)).collect();
     match page {
-        Page::Main => vec![
-            ("Display", only(vec![Field::Layout, Field::Aspect, Field::Resolution, Field::Smooth, Field::Stretch, Field::Interpolate, Field::ShowFps, Field::ShowClock, Field::ShowBuilding, Field::ShowSaving, Field::Rotation, Field::Presenter])),
-            ("Performance", only(vec![Field::FrameCap, Field::Power])),
-            ("This game", (0..profile.options.len()).map(Field::Option).collect()),
-            ("Controls", only(vec![Field::TouchSpeed, Field::Cursor, Field::Buttons, Field::LeftStick, Field::Dpad, Field::RightStick, Field::ReverseTiltX, Field::ReverseTiltY, Field::TouchControls, Field::EditControls, Field::Mapping])),
-            ("Game", vec![Field::Resume, Field::Advanced, Field::Reset, Field::Quit]),
-        ],
+        Page::Main => {
+            let mut main = vec![
+                ("Display", only(vec![Field::Layout, Field::Aspect, Field::Resolution, Field::Smooth, Field::Stretch, Field::Interpolate, Field::ShowFps, Field::ShowClock, Field::ShowBuilding, Field::ShowSaving, Field::Rotation, Field::Presenter])),
+                ("Performance", only(vec![Field::FrameCap, Field::Power])),
+                ("This game", (0..profile.options.len()).map(Field::Option).collect()),
+                // only a game with a cheat file has cheats to list
+                ("Cheats", (0..cheats.len()).map(Field::Cheat).collect()),
+                ("Controls", only(vec![Field::TouchSpeed, Field::Cursor, Field::Buttons, Field::LeftStick, Field::Dpad, Field::RightStick, Field::ReverseTiltX, Field::ReverseTiltY, Field::TouchControls, Field::EditControls, Field::Mapping])),
+                ("Game", vec![Field::Resume, Field::Advanced, Field::Reset, Field::Quit]),
+            ];
+            main.retain(|(name, fields)| *name != "Cheats" || !fields.is_empty());
+            main
+        }
         Page::Advanced => vec![
             ("Applies at once", vec![Field::Toggle(0), Field::Toggle(29), Field::Toggle(30), Field::FrameSkip]),
             ("Speed hacks - requires restart", toggles(1..=11)),
@@ -209,7 +219,7 @@ fn step<T: Copy + PartialEq>(values: &[T], current: T, by: isize) -> T {
     values[(at + by).rem_euclid(values.len() as isize) as usize]
 }
 
-fn label(field: Field, settings: &Settings, game: &GameSettings, profile: &Profile) -> (String, String) {
+fn label(field: Field, settings: &Settings, game: &GameSettings, profile: &Profile, cheats: &[String]) -> (String, String) {
     let (name, value) = match field {
         Field::Layout => {
             let named = LAYOUTS.iter().find(|(layout, swapped, _)| (*layout, *swapped) == (settings.layout, settings.swapped));
@@ -273,6 +283,11 @@ fn label(field: Field, settings: &Settings, game: &GameSettings, profile: &Profi
             let on = game.options.get(&option.name).copied().unwrap_or(option.default);
             return (option.name.clone(), option.values[on as usize].clone());
         }
+        Field::Cheat(index) => {
+            let name = cheats.get(*index).cloned().unwrap_or_default();
+            let on = game.cheats.get(&name).copied().unwrap_or(false);
+            return (name, ON_OFF[on as usize].to_owned());
+        }
         Field::TouchSpeed => ("Touch cursor speed", format!("{:?}", settings.touch_speed)),
         Field::Cursor => ("Touch cursor", format!("{:?}", settings.cursor)),
         Field::Buttons => ("A/B layout", format!("{:?}", settings.buttons)),
@@ -320,7 +335,7 @@ fn label(field: Field, settings: &Settings, game: &GameSettings, profile: &Profi
     (name.to_owned(), value)
 }
 
-fn change(field: Field, by: isize, settings: &mut Settings, game: &mut GameSettings, profile: &Profile) {
+fn change(field: Field, by: isize, settings: &mut Settings, game: &mut GameSettings, profile: &Profile, cheats: &[String]) {
     match field {
         Field::Layout => {
             let at = LAYOUTS.iter().position(|(layout, swapped, _)| (*layout, *swapped) == (settings.layout, settings.swapped));
@@ -348,6 +363,12 @@ fn change(field: Field, by: isize, settings: &mut Settings, game: &mut GameSetti
             let option = &profile.options[index];
             let on = game.options.get(&option.name).copied().unwrap_or(option.default);
             game.options.insert(option.name.clone(), !on);
+        }
+        Field::Cheat(index) => {
+            if let Some(name) = cheats.get(*index) {
+                let on = game.cheats.get(name).copied().unwrap_or(false);
+                game.cheats.insert(name.clone(), !on);
+            }
         }
         Field::TouchSpeed => settings.touch_speed = step(&[Speed::Slow, Speed::Normal, Speed::Fast], settings.touch_speed, by),
         Field::Cursor => settings.cursor = step(&[Cursor::Auto, Cursor::Shown, Cursor::Hidden], settings.cursor, by),
@@ -387,7 +408,7 @@ fn change(field: Field, by: isize, settings: &mut Settings, game: &mut GameSetti
 }
 
 /// what the help under the list says about a field.
-fn help(field: Field, profile: &Profile) -> &str {
+fn help(field: Field, profile: &Profile, _cheats: &[String]) -> &str {
     match field {
         Field::Layout => "Where the screens go. A tap of L2 swaps them, FN or L3 with R1 switch to one big screen.",
         Field::Aspect => "The screens' shape: as on the 3DS, by whole pixels, 4:3, 16:10, 16:9, stretched, or the top one's sides cropped.",
@@ -404,6 +425,7 @@ fn help(field: Field, profile: &Profile) -> &str {
         Field::Presenter => "OpenGL ES draws on the GPU, Vulkan just shows the screens. Restart the game for it.",
         Field::Power => "How fast the CPU and GPU run. Performance is fastest and warmest, Saver lasts longest.",
         Field::Option(index) => &profile.options[index].help,
+        Field::Cheat(_) => "A code from the game's cheat file, written again every frame while it is on.",
         Field::TouchSpeed => "How fast the right stick moves the touch cursor. R2 or R3 touches.",
         Field::Cursor => "The cursor over the bottom screen. Auto hides it on two screens but while the stick moves it.",
         Field::Buttons => "Which face buttons are A and B: where Nintendo puts them, or where Xbox does.",
@@ -480,10 +502,15 @@ impl Menu {
         (self.open, self.page, self.confirm) = (true, Page::Main, None);
     }
 
+    /// the running game's cheats, for the list beside its settings.
+    pub fn set_cheats(&mut self, cheats: Vec<String>) {
+        self.cheats = cheats;
+    }
+
     /// back from the advanced settings to the entry that opened them.
     fn back(&mut self, profile: &Profile) -> Action {
         let from = if self.page == Page::Buttons { Field::Mapping } else { Field::Advanced };
-        let fields: Vec<Field> = sections(Page::Main, profile).into_iter().flat_map(|(_, fields)| fields).collect();
+        let fields: Vec<Field> = sections(Page::Main, profile, &self.cheats).into_iter().flat_map(|(_, fields)| fields).collect();
         (self.page, self.confirm) = (Page::Main, None);
         self.cursor = fields.iter().position(|&field| field == from).unwrap_or(0);
         Action::Redraw
@@ -497,7 +524,7 @@ impl Menu {
         let pressed = |key: u16| keys.contains(&key) && !self.last.contains(&key);
         let (a, b) = (pressed(A), pressed(B));
         self.last = keys.clone();
-        let fields: Vec<Field> = sections(self.page, profile).into_iter().flat_map(|(_, fields)| fields).collect();
+        let fields: Vec<Field> = sections(self.page, profile, &self.cheats).into_iter().flat_map(|(_, fields)| fields).collect();
         self.cursor = self.cursor.min(fields.len() - 1);
         let field = fields[self.cursor];
         match direction.filter(|_| repeat) {
@@ -507,7 +534,7 @@ impl Menu {
                 return Action::Redraw;
             }
             Some(key) if !field.action() => {
-                change(field, if key == LEFT { -1 } else { 1 }, settings, game, profile);
+                change(field, if key == LEFT { -1 } else { 1 }, settings, game, profile, &self.cheats);
                 return Action::Changed;
             }
             _ => {}
@@ -551,7 +578,7 @@ impl Menu {
             Field::Name => Action::EditName,
             Field::Quit => Action::Quit,
             field => {
-                change(field, 1, settings, game, profile);
+                change(field, 1, settings, game, profile, &self.cheats);
                 Action::Changed
             }
         }
@@ -583,7 +610,7 @@ impl Menu {
         // the selected field in view
         let mut rows = Vec::new();
         let (mut y, mut index, mut selected) = (0.0, 0, 0.0);
-        for (section, fields) in sections(self.page, profile) {
+        for (section, fields) in sections(self.page, profile, &self.cheats) {
             y += 3.0;
             if !section.is_empty() {
                 rows.push((y, None, section));
@@ -627,7 +654,7 @@ impl Menu {
             if selected {
                 canvas.fill([x0 + 8.0, y - 2.0, x1 - 8.0, y + 17.0], rgba(HIGHLIGHT, 255));
             }
-            let (name, value) = label(field, settings, game, profile);
+            let (name, value) = label(field, settings, game, profile, &self.cheats);
             if self.confirm == Some(index) {
                 let ask = match field {
                     Field::Quit => "Quit? Unsaved progress is lost",
@@ -643,9 +670,9 @@ impl Menu {
             }
         }
         canvas.fill([x0 + 10.0, help_top, x1 - 10.0, help_top + 1.0], rgba([32, 48, 72], 255));
-        let fields: Vec<Field> = sections(self.page, profile).into_iter().flat_map(|(_, fields)| fields).collect();
+        let fields: Vec<Field> = sections(self.page, profile, &self.cheats).into_iter().flat_map(|(_, fields)| fields).collect();
         if let Some(&field) = fields.get(self.cursor) {
-            let lines = wrap(canvas, SMALL, help(field, profile), x1 - x0 - 28.0);
+            let lines = wrap(canvas, SMALL, help(field, profile, &self.cheats), x1 - x0 - 28.0);
             for (line, text) in lines.iter().take(2).enumerate() {
                 canvas.text(SMALL, text, x0 + 14.0, help_top + 6.0 + line as f32 * 16.0, rgba(DIM, 255), false);
             }
@@ -800,9 +827,9 @@ mod tests {
         let profile = Profile::default();
         let long: Vec<String> = [Page::Main, Page::Advanced, Page::Buttons]
             .into_iter()
-            .flat_map(|page| sections(page, &profile).into_iter().flat_map(|(_, fields)| fields))
+            .flat_map(|page| sections(page, &profile, &[]).into_iter().flat_map(|(_, fields)| fields))
             .filter_map(|field| {
-                let lines = wrap(&canvas, SMALL, help(field, &profile), 400.0 - 28.0);
+                let lines = wrap(&canvas, SMALL, help(field, &profile, &[]), 400.0 - 28.0);
                 (lines.is_empty() || lines.len() > 2).then(|| format!("{field:?}: {lines:?}"))
             })
             .collect();
@@ -813,7 +840,7 @@ mod tests {
     /// needs a place in a section.
     #[test]
     fn every_toggle_has_its_place() {
-        let fields: Vec<Field> = sections(Page::Advanced, &Profile::default()).into_iter().flat_map(|(_, fields)| fields).collect();
+        let fields: Vec<Field> = sections(Page::Advanced, &Profile::default(), &[]).into_iter().flat_map(|(_, fields)| fields).collect();
         for index in 0..TOGGLES.len() {
             let count = fields.iter().filter(|&&field| field == Field::Toggle(index)).count();
             assert_eq!(count, 1, "{} is in the advanced settings {count} times", TOGGLES[index].0);
@@ -852,16 +879,43 @@ mod tests {
     #[test]
     fn the_button_page_maps_and_goes_back() {
         let (mut settings, mut game, profile) = (Settings::default(), GameSettings::default(), Profile::default());
-        change(Field::Map(0), 1, &mut settings, &mut game, &profile);
+        change(Field::Map(0), 1, &mut settings, &mut game, &profile, &[]);
         assert_eq!(game.buttons.get("A"), Some(&Key::A));
-        change(Field::Map(0), -1, &mut settings, &mut game, &profile);
-        change(Field::Map(0), -1, &mut settings, &mut game, &profile);
+        change(Field::Map(0), -1, &mut settings, &mut game, &profile, &[]);
+        change(Field::Map(0), -1, &mut settings, &mut game, &profile, &[]);
         assert_eq!(game.buttons.get("A"), Some(&Key::Off));
-        change(Field::Unmap, 1, &mut settings, &mut game, &profile);
+        change(Field::Unmap, 1, &mut settings, &mut game, &profile, &[]);
         assert!(game.buttons.is_empty());
         let mut menu = Menu { page: Page::Buttons, ..Menu::default() };
         menu.back(&profile);
-        let fields: Vec<Field> = sections(Page::Main, &profile).into_iter().flat_map(|(_, fields)| fields).collect();
+        let fields: Vec<Field> = sections(Page::Main, &profile, &[]).into_iter().flat_map(|(_, fields)| fields).collect();
         assert_eq!(fields[menu.cursor], Field::Mapping);
+    }
+
+    /// a cheat file's codes are listed under the game's settings, switch on
+    /// and off, and stay switched as the player left them.
+    #[test]
+    fn the_cheats_are_listed_and_switched() {
+        let (mut settings, mut game, profile) = (Settings::default(), GameSettings::default(), Profile::default());
+        let cheats = vec!["Infinite money".to_owned(), "Moon jump".to_owned()];
+        let fields: Vec<Field> = sections(Page::Main, &profile, &cheats).into_iter().flat_map(|(_, fields)| fields).collect();
+        assert!(fields.contains(&Field::Cheat(0)) && fields.contains(&Field::Cheat(1)));
+        assert_eq!(label(Field::Cheat(1), &settings, &game, &profile, &cheats).1, "Off");
+
+        change(Field::Cheat(1), 1, &mut settings, &mut game, &profile, &cheats);
+        assert_eq!(game.cheats.get("Moon jump"), Some(&true));
+        assert_eq!(label(Field::Cheat(1), &settings, &game, &profile, &cheats).1, "On");
+        change(Field::Cheat(1), 1, &mut settings, &mut game, &profile, &cheats);
+        assert_eq!(game.cheats.get("Moon jump"), Some(&false));
+
+        // a game with no cheat file has no such section
+        let fields: Vec<Field> = sections(Page::Main, &profile, &[]).into_iter().flat_map(|(_, fields)| fields).collect();
+        assert!(!fields.iter().any(|field| matches!(field, Field::Cheat(_))));
+
+        // and the help for one fits its two lines
+        let font = Font::load();
+        let canvas = Canvas::new(&font, (640, 480));
+        let lines = wrap(&canvas, SMALL, help(Field::Cheat(0), &profile, &cheats), 400.0 - 28.0);
+        assert!(!lines.is_empty() && lines.len() <= 2, "{lines:?}");
     }
 }

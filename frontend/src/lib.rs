@@ -252,6 +252,8 @@ pub fn run(mut args: Vec<String>) {
     log::info!("Pocket Native {}, {title}, {} options", env!("CARGO_PKG_VERSION"), profile.options.len());
     let base_drops = std::env::var("ZAKURO_DROP_DRAWS").unwrap_or_default();
     apply_options(&mut system, &game, &profile, &base_drops);
+    // the cheats this game had on when it was last played
+    system.set_cheats(&game.cheats);
     let mut probe = probing.then(|| probe::Probe::new(title_id, args.get(1).and_then(|frames| frames.parse().ok()).unwrap_or(3600)));
     if probe.is_none() {
         apply_power(settings.power);
@@ -474,6 +476,8 @@ pub fn run(mut args: Vec<String>) {
         if menu.open || tapped {
             let action = if !menu.open {
                 menu.show();
+                // the cheats the game's file holds, which the menu lists
+                menu.set_cheats(system.cheat_names());
                 Action::Redraw
             } else if tapped {
                 menu.open = false;
@@ -487,6 +491,7 @@ pub fn run(mut args: Vec<String>) {
                 Action::Redraw => menu_drawn = false,
                 Action::Changed => {
                     apply_options(&mut system, &game, &profile, &base_drops);
+                    system.set_cheats(&game.cheats);
                     let advanced = Advanced::of(&game, &profile);
                     (most_skipped, shown_only) = (fixed_skip.unwrap_or(advanced.frame_skip), advanced.shown_only);
                     apply_power(settings.power);

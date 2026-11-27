@@ -1,6 +1,7 @@
 //! the emulated console, CPU, memory, HLE kernel, HLE services and GPU, and
 //! the loop that drives them.
 
+pub mod cheats;
 pub mod cro;
 pub mod hints;
 pub mod kernel;
@@ -132,6 +133,9 @@ pub struct System {
     /// the title's downloadable content, the DLC CIAs beside its file whose
     /// id is its own.
     pub dlc: Vec<zakuro_fs::Dlc>,
+    /// the cheats in the title's cheat file, written over memory as each
+    /// frame starts while they are on.
+    pub cheats: cheats::Cheats,
     pub config: Config,
 
     pub exited: bool,
@@ -241,6 +245,7 @@ impl System {
             renderer: Box::new(SoftwareRenderer::default()),
             title: None,
             dlc: Vec::new(),
+            cheats: cheats::Cheats::default(),
             config,
             exited: false,
             broke: false,
@@ -272,6 +277,16 @@ impl System {
             interpreted_instructions: 0,
             recompiled_instructions: 0,
         }
+    }
+
+    /// the cheats the title's file holds, for the menu to list.
+    pub fn cheat_names(&self) -> Vec<String> {
+        self.cheats.names()
+    }
+
+    /// turns the cheats the menu's settings name on, and the rest off.
+    pub fn set_cheats(&mut self, enabled: &BTreeMap<String, bool>) {
+        self.cheats.set(enabled);
     }
 
     // -- process setup ------------------------------------------------------
@@ -740,6 +755,12 @@ impl System {
     /// everything that happens between frames, vertical blank, input, clock.
     fn end_frame(&mut self) {
         self.frames += 1;
+        // the cheats a player turned on write their values again, once a
+        // frame, before the game's next frame reads them
+        if !self.cheats.is_empty() {
+            self.cheats.buttons = self.services.hid.input.buttons.bits();
+            self.cheats.apply(&mut self.memory);
+        }
         if self.frames.is_multiple_of(hints::SAVE_EVERY) {
             if let Some(hints) = &mut self.hints {
                 hints.save();

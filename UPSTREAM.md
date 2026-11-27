@@ -41,6 +41,19 @@ the one that draws the 3D on the GPU, is still the gap above.
   (pocket-native-32bit-apk); ci.yml, which builds the workspace, tests it
   and cross-builds a 64-bit library, runs for a pull request or by hand
 
+## cheats
+
+upstream reads the cheats Citra and Azahar use, and this fork does too: a
+`cheats/<TitleID>.txt` in the game's data folder (upper or lower case), its
+`[name]` codes listed in the menu with an on and off each, kept per game in
+its `settings.toml`. `0`, `1` and `2` write 32, 16 and 8 bits, `3` to `A`
+compare a word or a masked halfword, `B` loads the offset, `D3` and `DC` set
+and add to it, `C` to `D1` loop, `DD` fires while its buttons are held, and
+`D0` and `D2` end a block; the engine writes the codes that are on once a
+frame. a line it does not know, and the `E` patch code, are logged and left
+out rather than guessed at. mods are the next gap: upstream lays a game's
+`mods/` folder over its files, this fork does not yet.
+
 ## why the recompiler does not follow 3dsrecomp anymore
 
 fearkov's 3dsrecomp went on to interface 8 after the recompiler in

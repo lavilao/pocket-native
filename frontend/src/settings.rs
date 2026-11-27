@@ -246,6 +246,9 @@ pub struct GameSettings {
     /// the game's own buttons: a 3DS button, by name, to the handheld's that
     /// presses it, the others as the controls set them.
     pub buttons: BTreeMap<String, Key>,
+    /// the cheats the player turned on, by the name the game's cheat file
+    /// gives each.
+    pub cheats: BTreeMap<String, bool>,
 }
 
 /// a handheld button in a game's mapping, or none.
@@ -264,7 +267,7 @@ pub enum Key {
 
 impl Default for GameSettings {
     fn default() -> Self {
-        GameSettings { language: LANGUAGE_ENGLISH, region: REGION_USA, options: BTreeMap::new(), advanced: None, layout: None, swapped: None, buttons: BTreeMap::new() }
+        GameSettings { language: LANGUAGE_ENGLISH, region: REGION_USA, options: BTreeMap::new(), advanced: None, layout: None, swapped: None, buttons: BTreeMap::new(), cheats: BTreeMap::new() }
     }
 }
 
