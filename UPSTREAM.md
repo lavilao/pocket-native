@@ -36,9 +36,10 @@ the one that draws the 3D on the GPU, is still the gap above.
     host holds the whole 4 GiB as it is
   - src/rom.rs — a .cia of an update names its build after the
     update's title id, which the running system looks it up by
-- the app is built 32-bit only, in its own workflow, ci-32bit.yml, and
-  its artifact is the APK (pocket-native-32bit-apk); ci.yml builds and
-  tests the workspace and no longer builds a 64-bit Android library
+- the app is built 32-bit only on a push, in its own workflow,
+  ci-32bit.yml, and its artifact is the APK
+  (pocket-native-32bit-apk); ci.yml, which builds the workspace, tests it
+  and cross-builds a 64-bit library, runs for a pull request or by hand
 
 ## why the recompiler does not follow 3dsrecomp anymore
 
