@@ -172,7 +172,7 @@ impl Presenter {
         }
         let entry = super::entry()?;
         let instance = super::instance(&entry, &surface_extensions())?;
-        let surface_fn = ash::khr::surface::Instance::load(&entry, &instance);
+        let surface_fn = ash::khr::surface::Instance::new(&entry, &instance);
         let surface = match unsafe { make_surface(&entry, &instance, window) } {
             Ok(surface) => surface,
             Err(error) => {
@@ -218,7 +218,7 @@ impl Presenter {
                 return Err(format!("no Vulkan device: {error}"));
             }
         };
-        let swapchain_fn = ash::khr::swapchain::Device::load(&instance, &device);
+        let swapchain_fn = ash::khr::swapchain::Device::new(&instance, &device);
         // SAFETY: a queue of the family the device was made with
         let queue = unsafe { device.get_device_queue(family, 0) };
         let mut presenter = Presenter {
@@ -525,7 +525,7 @@ impl Presenter {
         let buffers = [command];
         let submit = vk::SubmitInfo::default()
             .wait_semaphores(&[self.available[frame]])
-            .wait_destination_stage_mask(&waits)
+            .wait_dst_stage_mask(&waits)
             .command_buffers(&buffers)
             .signal_semaphores(&[self.finished[index]]);
         // SAFETY: a submit of the frame's own command buffer, fence and
@@ -805,26 +805,29 @@ fn pick_format(formats: &[vk::SurfaceFormatKHR]) -> Option<vk::Format> {
 
 /// the surface's extensions: the surface itself, and on android the window it
 /// is made from.
+#[cfg(target_os = "android")]
 fn surface_extensions() -> Vec<*const c_char> {
-    let mut extensions = vec![ash::khr::surface::NAME.as_ptr()];
-    #[cfg(target_os = "android")]
-    extensions.push(ash::khr::android_surface::NAME.as_ptr());
-    extensions
+    vec![ash::khr::surface::NAME.as_ptr(), ash::khr::android_surface::NAME.as_ptr()]
+}
+
+#[cfg(not(target_os = "android"))]
+fn surface_extensions() -> Vec<*const c_char> {
+    vec![ash::khr::surface::NAME.as_ptr()]
 }
 
 /// a surface on the window set_window gave: an android window, which is the
 /// window a handheld app is given. a handheld's panel is KMS otherwise, which
 /// Vulkan shows to through a display extension most drivers lack.
+#[cfg(target_os = "android")]
 unsafe fn make_surface(entry: &ash::Entry, instance: &ash::Instance, window: *mut c_void) -> Result<vk::SurfaceKHR, String> {
-    let _ = (entry, instance, window);
-    #[cfg(target_os = "android")]
-    {
-        // SAFETY: an android window the activity handed the renderer
-        let info = vk::AndroidSurfaceCreateInfoKHR::default().window(window.cast());
-        let android = ash::khr::android_surface::Instance::load(entry, instance);
-        return unsafe { android.create_android_surface(&info, None) }.map_err(|error| format!("no Vulkan android surface: {error}"));
-    }
-    #[cfg(not(target_os = "android"))]
+    // SAFETY: an android window the activity handed the renderer
+    let info = vk::AndroidSurfaceCreateInfoKHR::default().window(window.cast());
+    let android = ash::khr::android_surface::Instance::new(entry, instance);
+    unsafe { android.create_android_surface(&info, None) }.map_err(|error| format!("no Vulkan android surface: {error}"))
+}
+
+#[cfg(not(target_os = "android"))]
+unsafe fn make_surface(_entry: &ash::Entry, _instance: &ash::Instance, _window: *mut c_void) -> Result<vk::SurfaceKHR, String> {
     Err("the screens go to a panel KMS drives, which Vulkan cannot show to here".into())
 }
 
