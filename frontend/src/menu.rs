@@ -401,7 +401,7 @@ fn help(field: Field, profile: &Profile) -> &str {
         Field::ShowSaving => "The word in the top right corner while the game saves, to leave the power on. Off hides it.",
         Field::Rotation => "Turns the picture for a screen that shows it the wrong way round. Takes effect when the game starts again.",
         Field::FrameCap => "The most pictures shown a second. Lower lasts longer and runs cooler.",
-        Field::Presenter => "OpenGL ES draws with the handheld's GPU. Vulkan shows the software-drawn screens itself, for a driver whose shader compiler crashes. Restart the game for it.",
+        Field::Presenter => "OpenGL ES draws on the GPU, Vulkan just shows the screens. Restart the game for it.",
         Field::Power => "How fast the CPU and GPU run. Performance is fastest and warmest, Saver lasts longest.",
         Field::Option(index) => &profile.options[index].help,
         Field::TouchSpeed => "How fast the right stick moves the touch cursor. R2 or R3 touches.",
