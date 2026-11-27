@@ -522,20 +522,27 @@ impl Presenter {
         }
 
         let waits = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        // the submit and the present hold on to these past this statement, so
+        // they are not made up in place in the builder
+        let waiting = [self.available[frame]];
         let buffers = [command];
+        let signalled = [self.finished[index]];
         let submit = vk::SubmitInfo::default()
-            .wait_semaphores(&[self.available[frame]])
+            .wait_semaphores(&waiting)
             .wait_dst_stage_mask(&waits)
             .command_buffers(&buffers)
-            .signal_semaphores(&[self.finished[index]]);
+            .signal_semaphores(&signalled);
         // SAFETY: a submit of the frame's own command buffer, fence and
         // semaphores
         unsafe { device.queue_submit(self.queue, &[submit], self.fences[frame]) }
             .map_err(|error| format!("no Vulkan frame submitted: {error}"))?;
+        let drawn = [self.finished[index]];
+        let swapchains = [self.swapchain];
+        let indices = [index as u32];
         let present = vk::PresentInfoKHR::default()
-            .wait_semaphores(&[self.finished[index]])
-            .swapchains(&[self.swapchain])
-            .image_indices(&[index as u32]);
+            .wait_semaphores(&drawn)
+            .swapchains(&swapchains)
+            .image_indices(&indices);
         // SAFETY: a present of the image just drawn into
         let shown = unsafe { self.swapchain_fn.queue_present(self.queue, &present) };
         self.frame = (frame + 1) % FRAMES;
